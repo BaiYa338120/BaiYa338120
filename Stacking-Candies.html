@@ -938,7 +938,6 @@ function unplaceBlock(id) {
   if (!removePlacedBlock(id)) return;
   state.selectedId = null; state.hintCells = null; state.hintBlockId = null;
   clearPreview(); renderLibrary(); renderGrid();
-  flashMsg('方块已放回装备区');
 }
 // 操作前压入完整快照(放置/移动/旋转每次算一步),供"撤回"逐步回溯
 function pushSnapshot() {
