@@ -1,0 +1,2575 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RAPID SNAKE</title>
+<style>
+  /* ============ 页面基础样式 ============ */
+  * { margin: 0; padding: 0; box-sizing: border-box; user-select: none; -webkit-user-select: none; -webkit-tap-highlight-color: transparent; -webkit-touch-callout: none; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #000; }
+  body {
+    /* 深色背景 + 中央微弱辉光，突出游戏画面 */
+    background: radial-gradient(ellipse at center, #0d1510 0%, #050806 70%, #000 100%);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  #stage { position: relative; touch-action: none; user-select: none; -webkit-touch-callout: none; }
+  html, body { overscroll-behavior: none; }
+  canvas {
+    display: block;
+    background: #0a0f0c;
+    image-rendering: pixelated;              /* 放大后保持复古像素质感 */
+    box-shadow: 0 0 40px rgba(120, 220, 150, .12), 0 0 8px rgba(0, 0, 0, .9);
+    touch-action: none;                      /* 画板拖拽绘制时禁止浏览器手势 */
+  }
+  /* ============ 移动端暂停按钮（仅触屏设备对局中显示） ============ */
+  #pauseBtn {
+    position: absolute;
+    top: 8px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 42px;
+    height: 42px;
+    border-radius: 9px;
+    background: rgba(0, 0, 0, .32);
+    color: #fff;
+    font: bold 20px sans-serif;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 3;
+    cursor: pointer;
+    touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;
+  }
+  #pauseBtn.hidden { display: none; }
+  /* ============ 复古扫描线遮罩（CRT 风格，覆盖在画面上但不拦截点击） ============ */
+  #scan {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    z-index: 2;
+    background:
+      repeating-linear-gradient(
+        to bottom,
+        rgba(0, 0, 0, 0) 0px,
+        rgba(0, 0, 0, 0) 2px,
+        rgba(0, 0, 0, .18) 3px,
+        rgba(0, 0, 0, 0) 4px
+      );
+  }
+</style>
+</head>
+<body>
+<div id="stage">
+  <canvas id="cv"></canvas>
+  <div id="scan"></div>
+  <div id="pauseBtn" class="hidden">❚❚</div>
+</div>
+
+<script>
+"use strict";
+/* ================================================================
+ * 一、常量与全局配置
+ * ================================================================ */
+const W = 400, H = 700;           // 游戏逻辑尺寸（固定 400×700）
+const CELL = 20;                  // 一格 = 20 像素（整屏 20 列 × 35 行）
+const GRID_W = W / CELL;          // 列数 20
+const GRID_H = H / CELL;          // 行数 35
+const SEG_R = 9;                  // 蛇节方块与尖刺碰撞用的近似圆半径
+
+const PLAT_W = 6;                 // 平台宽度（格数）
+const PLAT_H = 1;                 // 平台高度（格数）
+const GAP_CHOICES = [4, 8, 12];   // 上下平台之间的"空隙"格数候选（从其中随机，不含平台本身）
+
+const SCROLL_BASE = 40;            // 镜头初始滚动速度 px/s（2 格/秒）
+const SCROLL_ACCEL = 2.0;          // 滚动加速：每 1 秒 +0.1 格/秒（= 2 px/s²，难度递增）
+const SCROLL_MAX = 160;            // 滚动速度上限 px/s（8 格/秒）
+const SPIKE_BASE = 0.05;          // 平台每格初始生成尖刺的概率（5%）
+const SPIKE_ACCEL = 0.0035;       // 尖刺概率每秒增量（难度递增）
+const SPIKE_MAX = 0.20;           // 每格带刺概率上限（20%）
+const SPIKE_H = 14, SPIKE_HW = 8; // 尖刺高度 与 底边半宽
+const FALL_START = 0.30;          // 悬空下落的初始间隔（秒），间隔越短越快
+const TAP_INTERVAL = 1 / 6;       // 点按限速：连点最多每 1/6 秒移动一格
+const HOLD_INTERVAL = 1 / 4;       // 长按限速：按住持续移动每 1/4 秒一格
+const BEST_KEY = 'rapid_snake_best';     // localStorage 中保存最高分的键名
+const BEST_KEY_LEGACY = 'abyss_snake_best'; // 旧版键名（启动时自动迁移到新键）
+
+/* ============ 画布与自适应缩放 ============ */
+const canvas = document.getElementById('cv');
+const ctx = canvas.getContext('2d');
+canvas.width = W;
+canvas.height = H;
+
+/* 画布填满视口但保持 400×700 比例（contain 缩放，居中显示） */
+function fitCanvas() {
+  const s = Math.min(window.innerWidth / W, window.innerHeight / H);
+  canvas.style.width  = (W * s) + 'px';
+  canvas.style.height = (H * s) + 'px';
+}
+window.addEventListener('resize', fitCanvas);
+fitCanvas();
+
+/* 触屏设备检测（决定是否显示暂停按钮、启用触控滑动） */
+const isTouch = ('ontouchstart' in window) || navigator.maxTouchPoints > 0;
+
+/* ============ 游戏状态变量 ============ */
+let state = 'ready';              // ready 主菜单 | hats 帽子界面 | playing 游戏中 | settings 设置(暂停) | dead 游戏结束
+let platforms = [];               // 平台数组（格坐标，索引 0 是最上方）
+let snake = [];                   // 蛇的每一节格坐标 {c, r}，snake[0]=蛇头
+let apple = null;                 // 苹果 {c, r, plat}
+let scrollAcc = 0;                // 镜头滚动累积量（每满一格镜头下移一格）
+let camR = 0;                     // 镜头在世界中的行号（画面顶=世界行 camR；世界固定，镜头向下走）
+let fallTimer = 0;                // 悬空下落计时器
+let fallInterval = FALL_START;    // 当前下落间隔（越掉越快）
+let growPending = 0;              // 待生长的节数（吃到苹果后，蛇头下次移动时不消尾、长一节）
+let headDir = 'left';             // 蛇头朝向（用于画眼睛）：left/right/up
+let pendingMove = null;           // 按键待执行的移动（点一下走一格，延迟到 update 内执行）
+let heldDir = null;               // 当前按住的方向（长按连续移动，null=未按住）
+let tapCd = TAP_INTERVAL;         // 点按冷却（初始为满：按下即可立刻走第一格；连点每 1/6 秒一格）
+let holdCd = HOLD_INTERVAL;       // 长按冷却（初始为满：长按每 1/4 秒一格）
+let squash = 0;                   // 着落压扁程度（0~1，逐步复原）
+let trailFx = [];                 // 蛇头残影（拖尾特效，像素坐标）
+let score = 0;                    // 总分（浮点）= 生存秒数 + 苹果×5
+let gameTime = 0;                 // 本局已进行的秒数（供刺概率/滚动加速计算）
+let scrollSpeed = SCROLL_BASE;    // 当前镜头滚动速度（=画面中内容上移的速度）
+let best = 0;                     // 历史最高分（浮点）
+let deathAt = 0;                  // 死亡时刻（用于防止误触快速重开）
+let newRecord = false;            // 本局是否打破纪录
+let nowMs = 0;                    // 当前时间戳（毫秒，rAF 提供）
+
+/* 从 localStorage 读取最高分（异常环境下自动回退为 0；旧键名数据自动迁移） */
+try { best = parseFloat(localStorage.getItem(BEST_KEY) || '0') || 0; }
+catch (e) { best = 0; }
+if (!best) {
+  try {
+    const legacy = parseFloat(localStorage.getItem(BEST_KEY_LEGACY) || '0') || 0;
+    if (legacy > 0) { best = legacy; localStorage.setItem(BEST_KEY, String(best)); }
+    localStorage.removeItem(BEST_KEY_LEGACY);
+  } catch (e) {}
+}
+
+/* ============ 帽子系统：局外资源（苹果总库）+ 永久拥有的帽子 + 当前装备 ============ */
+const APPLES_KEY = 'rapid_snake_apples';   // 苹果总库（局外资源，抽装饰用）
+const HATS_KEY   = 'rapid_snake_hats_owned'; // 永久拥有的帽子 id 列表
+const SKINS_KEY  = 'rapid_snake_skins_owned';// 永久拥有的皮肤 id 列表（green 默认）
+const SCENES_KEY = 'rapid_snake_scenes_owned';// 永久拥有的场景 id 列表（green 默认）
+const EQUIP_KEY  = 'rapid_snake_hat_equip';  // 当前装备的帽子 id
+const EQUIP_SKIN = 'rapid_snake_skin_equip'; // 当前装备的皮肤 id
+const EQUIP_SCENE= 'rapid_snake_scene_equip';// 当前装备的场景 id
+const CH_KEY     = 'rapid_snake_ch_own';      // 自制帽子数据 [{id,px}]，px 为 20×20 像素
+const CH_EQUIP   = 'rapid_snake_ch_equip';    // 当前装备的自制帽子 id
+const HAT_COST   = 20;                        // 抽一次需要的苹果数
+const CH_MAX     = 12;                        // 自制帽子最多保存 12 顶
+const CH_CELLS   = 20;                        // 自制帽子画板：20×20 像素
+/* 帽子美术内置在 HTML 中（base64 data URL），不依赖外部图片文件。
+ * 若要在"帽子"文件夹新增帽子：把新 PNG 转成 base64 后，按 HAT_IDS/下面
+ * "内置帽子"的格式加入新条目 + 在 HAT_DATA 中注册即可，全屏都能显示。 */
+const HAT_IDS = ['cowboy', 'crown', 'tophat', 'wreath', 'goldhelmet', 'diamond', 'iron'];
+const HAT_META = {
+  cowboy: { name: '牛仔帽' },
+  crown:  { name: '王冠' },
+  tophat: { name: '高顶帽' },
+  wreath:     { name: '花环' },
+  goldhelmet: { name: '金头盔' },
+  diamond:    { name: '钻石头盔' },
+  iron:       { name: '铁头盔' },
+};
+
+/* ============ 蛇皮肤：默认绿 + 可抽取（黄/蓝/青） ============ */
+const SKIN_IDS  = ['green', 'yellow', 'blue', 'cyan', 'pink', 'purple', 'orange'];
+const DRAW_SKINS = ['yellow', 'blue', 'cyan', 'pink', 'purple', 'orange'];  // 可抽取的皮肤（green 为默认，不抽）
+const SKIN_META = {
+  green:  { name: '经典绿',  colors: { body: '#7cb93f', head: '#5c9c2b', line: '#17350a', hi: '#aedd72', eye: '#f4f8e8', pupil: '#0c1106' } },
+  yellow: { name: '黄蛇',    colors: { body: '#e0c02e', head: '#c9a71c', line: '#5a4a08', hi: '#f6e68a', eye: '#fff8e0', pupil: '#231a04' } },
+  blue:   { name: '蓝蛇',    colors: { body: '#3f7fc9', head: '#2f68b0', line: '#0b2650', hi: '#7fafe0', eye: '#e8f5ff', pupil: '#060d1c' } },
+  cyan:   { name: '青蛇',    colors: { body: '#2eb8b0', head: '#20a29b', line: '#08424a', hi: '#7fe0d8', eye: '#eafffc', pupil: '#051d20' } },
+  pink:   { name: '粉蛇',    colors: { body: '#f19fb2', head: '#d97e96', line: '#5c2033', hi: '#fbd0da', eye: '#fff5f8', pupil: '#2a0d15' } },
+  purple: { name: '紫蛇',    colors: { body: '#9b6fe0', head: '#8349c8', line: '#2a1140', hi: '#c9a8f1', eye: '#f6eeff', pupil: '#12051f' } },
+  orange: { name: '橙蛇',    colors: { body: '#f08a2f', head: '#d8721f', line: '#5a2a05', hi: '#f9c06a', eye: '#fff3e0', pupil: '#2a1204' } },
+};
+
+/* ============ 场景：默认黑绿 + 可抽取（白黄/白粉/白绿/黑蓝/黑紫） ============ */
+const SCENE_IDS  = ['green', 'white', 'pink', 'wgreen', 'blue', 'purple', 'worange'];
+const DRAW_SCENES = ['white', 'pink', 'wgreen', 'blue', 'purple', 'worange'];  // 可抽取场景（green 为默认，不抽）
+const SCENE_META = {
+  green:  { name: '黑绿场景', bg: ['#0c1410', '#070b09'], plat: { body: '#2e4a2c', top: '#b8e86a', bot: 'rgba(0,0,0,0.4)' }, trail: '#9fd44a' },
+  white:  { name: '白黄场景', light: true, bg: ['#f4f6ee', '#dfe6d6'], plat: { body: '#e0b93f', top: '#fff1a8', bot: 'rgba(120,90,10,0.3)' }, trail: '#e0c02e' },
+  pink:   { name: '白粉场景', light: true, bg: ['#fbeef0', '#f6dde0'], plat: { body: '#f2a0b0', top: '#ffe1e8', bot: 'rgba(120,45,60,0.28)' }, trail: '#f2a0b0' },
+  wgreen: { name: '白绿场景', light: true, bg: ['#eef6ec', '#dcecd6'], plat: { body: '#6fae3a', top: '#cdefa0', bot: 'rgba(40,80,15,0.28)' }, trail: '#7cb93f' },
+  blue:   { name: '黑蓝场景', bg: ['#0a1018', '#060a10'], plat: { body: '#2f5f8a', top: '#7fc0e8', bot: 'rgba(0,0,0,0.4)' }, trail: '#6fb4e0' },
+  purple: { name: '黑紫场景', bg: ['#150f1c', '#09070e'], plat: { body: '#553a7a', top: '#c9a0f0', bot: 'rgba(0,0,0,0.4)' }, trail: '#b48ce8' },
+  worange:{ name: '白橙场景', light: true, bg: ['#fdf6ee', '#f7e9d9'], plat: { body: '#ef8f2f', top: '#ffd9a0', bot: 'rgba(140,70,10,0.3)' }, trail: '#f39a45' },
+};
+
+/* 所有可抽取装饰品（共用奖池，抽过即不再出现，抽完即止） */
+const DECOR_POOL = [
+  ...HAT_IDS.map(id => ({ id, cat: 'hat' })),
+  ...DRAW_SKINS.map(id => ({ id, cat: 'skin' })),
+  ...DRAW_SCENES.map(id => ({ id, cat: 'scene' })),
+];
+function decoName(item) {
+  if (item.cat === 'hat') return HAT_META[item.id].name;
+  if (item.cat === 'ch') return chName(item.id);
+  if (item.cat === 'skin') return SKIN_META[item.id].name;
+  return SCENE_META[item.id].name;
+}
+/* 装饰类别辅助：按类别读写"已拥有"与"当前装备" */
+function ownedOf(cat) {
+  if (cat === 'hat') return ownedHats;
+  if (cat === 'ch') return chIds();
+  if (cat === 'skin') return ownedSkins;
+  return ownedScenes;
+}
+function equippedOf(cat) {
+  if (cat === 'hat') return equippedHat;
+  if (cat === 'ch') return equippedCh;
+  if (cat === 'skin') return equippedSkin;
+  return equippedScene;
+}
+function isOwned(item) { return ownedOf(item.cat).indexOf(item.id) >= 0; }
+function addOwned(item) { const arr = ownedOf(item.cat); if (arr.indexOf(item.id) < 0) arr.push(item.id); }
+function setEquipped(item) {
+  if (item.cat === 'hat') { equippedHat = item.id; equippedCh = null; }   // 普通帽与自制帽互斥
+  else if (item.cat === 'ch') { equippedCh = item.id; equippedHat = null; }
+  else if (item.cat === 'skin') equippedSkin = item.id;
+  else equippedScene = item.id;
+}
+/* 穿戴自制帽子（自动卸下普通帽子） */
+function wearCh(id) { setEquipped({ id, cat: 'ch' }); saveHatData(); }
+let decorTab = 'skin';  // 装饰界面当前标签：hat | skin | scene（默认打开皮肤页）
+/* —— 内置帽子（base64 编码的 PNG） —— */
+const HAT_DATA = {
+cowboy: 'data:image/png;base64,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',
+crown: 'data:image/png;base64,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',
+tophat: 'data:image/png;base64,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',
+wreath: 'data:image/png;base64,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', goldhelmet: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAZAAAAGQCAYAAACAvzbMAAAQAElEQVR4Aezb55IsR1oG4Jbw3nsCFm8lPBFAoMXDH10H17BXoGvgPhQEHlZBYCMwq8AEdhfvzeLNmnznnJrTM9PT06aqMrPyUVRNV5fJ/PLJUb1dPdLLO/8QIECAAIELBATIBWguIUCAAIHdToD4LSBQS0C/BDoXECCdT6DyCRAgUEtAgNSS1y8BAgQ6F+g4QDqXVz4BAgQ6FxAgnU+g8gkQIFBLQIDUktcvgY4FlE4gAgIkClYCBAgQOFtAgJxN5gICBAgQiIAAicLaq/4IECCwAQEBsoFJNAQCBAjUEBAgNdT1SYBALQH9ziggQGbE1BQBAgRGEhAgI822sRIgQGBGAQEyI+YITRkjAQIEJgEBMkl4JUCAAIGzBATIWVxOJkCAQC2B9voVIO3NiYoIECDQhYAA6WKaFEmAAIH2BARIe3OiomUEtEqAwMwCAmRmUM0RIEBgFAEBMspMGycBAgRmFjg5QGbuV3MECBAg0LmAAOl8ApVPgACBWgICpJa8fgmcLOBEAm0KCJA250VVBAgQaF5AgDQ/RQokQIBAmwIjBEib8qoiQIBA5wICpPMJVD4BAgRqCQiQWvL6JTCCgDFuWkCAbHp6DY4AAQLLCQiQ5Wy1TIAAgU0LCJCmp1dxBAgQaFdAgLQ7NyojQIBA0wICpOnpURwBArUE9Pu0gAB52sgZBAgQIHBAQIAcQLGLAAECBJ4WECBPGznjEgHXECCweQEBsvkpNkACBAgsIyBAlnHVKgECBGoJrNavAFmNWkcECBDYloAA2dZ8Gg0BAgRWExAgq1HrqBcBdRIgcJqAADnNyVkECBAgcE9AgNwD8ZYAAQIEThOYP0BO69dZBAgQINC5gADpfAKVT4AAgVoCAqSWvH4JzC+gRQKrCgiQVbl1RoAAge0ICJDtzKWRECBAYFUBAbLHbZMAAQIEThcQIKdbOZMAAQIE9gQEyB6GTQIEagnot0cBAdLjrKmZAAECDQgIkAYmQQkECBDoUUCA9DhrD2u2hwABAqsLCJDVyXVIgACBbQgIkG3Mo1EQIFBLYOB+BcjAk2/oBAgQuEZAgFyj51oCBAgMLCBABp78NoauCgIEehUQIL3OnLoJECBQWUCAVJ4A3RMgQKCWwLX9CpBrBV1PgACBQQUEyKATb9gECBC4VkCAXCvo+nEFjJzA4AICZPBfAMMnQIDApQIC5FI51xEgQGBwgYoBMri84RMgQKBzAQHS+QQqnwABArUEBEgtef0SqCigawJzCAiQORS1QYAAgQEFBMiAk27IBAgQmENAgFyi6BoCBAgQ2AkQvwQECBAgcJGAALmIzUUECFQS0G1DAgKkoclQCgECBHoSECA9zZZaCRAg0JCAAGloMtYoRR8ECBCYS0CAzCWpHQIECAwmIEAGm3DDJUCglsD2+hUg25tTIyJAgMAqAgJkFWadECBAYHsCAmR7c7rVERkXAQKNCQiQxiZEOQQIEOhFQID0MlPqJECAQC2BR/oVII/A2E2AAAECxwUEyHEfRwkQIEDgEQEB8giM3QTmE9ASgW0KCJBtzqtRESBAYHEBAbI4sQ4IECCwTYEeAmSb8kZFgACBzgUESOcTqHwCBAjUEhAgteT1S6AHATUSOCIgQI7gOESAAAECjwsIkMdtHCFAgACBIwIC5AjO9Ye0QIAAge0KCJDtzq2RESBAYFEBAbIor8YJEKgloN/lBQTI8sZ6IECAwCYFBMgmp9WgCBAgsLyAAFneuM8eVE2AAIEnBATIE0AOEyBAgMBhAQFy2MVeAgQI1BLopl8B0s1UKZQAAQJtCQiQtuZDNQQIEOhGQIB0M1UKPVXAeQQIrCMgQNZx1gsBAgQ2JyBANjelBkSAAIF1BB4GyDr96oUAAQIEOhcQIJ1PoPIJECBQS0CA1JLXL4GHAvYQ6EpAgHQ1XYolQIBAOwICpJ25UAkBAgS6EthUgHQlr1gCBAh0LiBAOp9A5RMgQKCWgACpJa9fApsSMJgRBQTIiLNuzAQIEJhBQIDMgKgJAgQIjCggQNqYdVUQIECgOwEB0t2UKZgAAQJtCAiQNuZBFQQI1BLQ78UCAuRiOhcSIEBgbAEBMvb8Gz0BAgQuFhAgF9O58JmAnwQIjCogQEadeeMmQIDAlQIC5EpAlxMgQKCWQO1+BUjtGdA/AQIEOhUQIJ1OnLIJECBQW0CA1J4B/dcT0DMBAlcJCJCr+FxMgACBcQUEyLhzb+QECBC4SuCKALmqXxcTIECAQOcCAqTzCVQ+AQIEagkIkFry+iVwhYBLCbQgIEBamAU1ECBAoEMBAdLhpCmZAAECLQiMGSAtyKuBAAECnQsIkM4nUPkECBCoJSBAasnrl8CYAka9IQEBsqHJNBQCBAisKSBA1tTWFwECBDYkIEA6m0zlEiBAoBUBAdLKTKiDAAECnQkIkM4mTLkECNQS0O99AQFyX8R7AgQIEDhJQICcxOQkAgQIELgvIEDui3i/lIB2CRDYmIAA2diEGg4BAgTWEhAga0nrhwABArUEFupXgCwEq1kCBAhsXUCAbH2GjY8AAQILCQiQhWA1uyUBYyFA4JCAADmkYh8BAgQIPCkgQJ4kcgIBAgQIHBJYI0AO9WsfAQIECHQuIEA6n0DlEyBAoJaAAKklr18Cawjog8CCAgJkQVxNEyBAYMsCL7/n3e/6kJWB3wG/A34H/A6c+zvgCeToxwMHCRAgQOAxAQHymIz9BAgQIHBUQIAc5XGQAIFaAvptX0CAtD9HKiRAgECTAgKkyWlRFAECBNoXECDtz9FlFbqKAAECCwsIkIWBNU+AAIGtCgiQrc6scREgUEtgmH4FyDBTbaAECBCYV0CAzOupNQIECAwjIECGmep+BqpSAgT6EBAgfcyTKgkQINCcgABpbkoURIAAgVoC5/UrQM7zcjYBAgQIPBcQIM8hvBAgQIDAeQIC5DwvZxM4JuAYgaEEBMhQ022wBAgQmE9AgMxnqSUCBAgMJdBUgAwlb7AECBDoXECAdD6ByidAgEAtAQFSS16/BJoSUAyB8wUEyPlmriBAgACBIiBACoKFAAECBM4XECDnmx26wj4CBAgMJyBAhptyAyZAgMA8AgJkHketECBQS0C/1QQESDV6HRMgQKBvAQHS9/ypngABAtUEBEg1+lY6VgcBAgQuExAgl7m5igABAsMLCJDhfwUAECBQS6D3fgVI7zOofgIECFQSECCV4HVLgACB3gUESO8zOHL9xk6AQFUBAVKVX+cECBDoV0CA9Dt3KidAgEAtgZt+BcgNgx8ECBAgcK6AADlXzPkECBAgcCMgQG4Y/CCwroDeCGxBoPkAeeW1d+zaXt8o9VlfeY0BA78Dc/8OtB4yzQdI64DqI0CAwKgCfQbIqLNl3AQIEGhIQIA0NBlKIUCAQE8CAqSn2VIrgfoCKiBwKyBAbilsECBAgMA5AgLkHC3nEiBAgMCtgAC5pVhnQy8ECBDYioAA2cpMGgcBAgRWFhAgK4PrjgCBWgL6nVtAgMwtqj0CBAgMIiBABplowyRAgMDcAgJkbtHttmdkBAgQuCMgQO5weEOAAAECpwoIkFOlnEeAAIFaAo32K0AanRhlESBAoHUBAdL6DKmPAAECjQoIkEYnRllzCmiLAIElBATIEqraJECAwAACAmSASTZEAgQILCFwSoAs0a82CRAgQKBzAQHS+QQqnwABArUEBEgtef0SOEXAOQQaFhAgDU+O0ggQINCygABpeXbURoAAgYYFNh4gDcsrjQABAp0LCJDOJ1D5BAgQqCUgQGrJ65fAxgUMb/sCAmT7c2yEBAgQWERAgCzCqlECBAhsX0CAtDrH6iJAgEDjAgKk8QlSHgECBFoVECCtzoy6CBCoJaDfEwUEyIlQTiNAgACBuwIC5K6HdwQIECBwooAAORHKaacLOJMAgTEEBMgY82yUBAgQmF1AgMxOqkECBAjUEli3XwGyrrfeCBAgsBkBAbKZqTQQAgQIrCvQQYD8aBFpeS3lWbYiYBwEmhJ43/vf2LW8dhAgTc2nYggQIEDguYAAeQ7hhQABAgTOE5g1QM7r2tkECBAg0LOAAOl59tROgACBigICpCK+rgnMJ6AlAusLCJD1zfVIgACBTQgIkE1Mo0EQIEBgfQEB8szcTwIECBA4U0CAnAnmdAIECBB4JiBAnjn4SYBALQH9disgQLqdOoUTIECgroAAqeuvdwIECHQrIEC6nbqpcK8ECBCoIyBA6rjrlQABAt0LCJDup9AACBCoJTB6vwJk9N8A4ydAgMCFAgLkQjiXESBAYHQBATL6b0DN8eubAIGuBQRI19OneAIECNQTECD17PVMgACBWgKz9CtAZmHUCAECBMYTECDjzbkREyBAYBYBATILo0ZGEzBeAgR2OwHit4AAAQIELhIQIBexuYgAAQIE6gQIdwIECBDoXkCAdD+FBkCAAIE6AgKkjrteCdQS0C+B2QQEyGyUGiJAgMBYAgJkrPk2WgIECMwmIEDOpHQ6AQIECDwTECDPHPwkQIAAgTMFBMiZYE4nQKCWgH5bExAgrc2IeggQINCJgADpZKKUSYAAgdYEBEhrM7JcPVomQIDArAICZFZOjREgQGAcAQEyzlwbKQECtQQ22q8A2ejEGhYBAgSWFmg+QN5+610763YNlv4F33r7rf+78eabu531coPWf3+bD5DWAdW3hoA+CBBoUUCAtDgraiJAgEAHAgKkg0lSIgECBGoJHOtXgBzTcYwAAQIEHhUQII/SOECAAAECxwQEyDEdxwhcK+B6AhsWECAbnlxDI0CAwJICAmRJXW0TIEBgwwKNB8iG5Q2NAAECnQsIkM4nUPkECBCoJSBAasnrl0DjAsoj8JSAAHlKyHECBAgQOCggQA6y2EmAAAECTwkIkKeELj3uOgIECGxcQIBsfIINjwABAksJCJClZLVLgEAtAf2uJCBAVoLWDQECBLYmIEC2NqPGQ4AAgZUEBMhK0D11o1YCBAicIiBATlFyDgECBAg8EBAgD0jsIECAQC2BvvoVIH3Nl2oJECDQjIAAaWYqFEKAAIG+BARIX/Ol2uMCjhIgsKKAAFkRW1cECBDYkoAA2dJsGgsBAgRWFLgTICv2qysCBAgQ6FxAgHQ+gconQIBALQEBUktevwTuCHhDoD8BAdLfnKmYAAECTQgIkCamQREECBDoT2ArAdKfvIoJECDQuYAA6XwClU+AAIFaAgKklrx+CWxFwDiGFRAgw069gRMgQOA6AQFynZ+rCRAgMKyAAKk+9QogQIBAnwICpM95UzUBAgSqCwiQ6lOgAAIEagno9zqB5gPk1Xe+8ZJ1uwa73Y+V3+B21zff3O1aXlv/d+P113cvWS83KP9yNL00HyBN6ymOAAECAwsIkIEn/+qha4AAgaEFBMjQ02/wBAgQuFxAgFxu50oCBAjUEmiiXwHSxDQoggABAv0JCJD+5kzFBAgQaEJAgDQxDYpYW0B/BAhcw8j7pwAACodJREFULyBArjfUAgECBIYUECBDTrtBEyBA4HqBywLk+n61QIAAAQKdCwiQzidQ+QQIEKglIEBqyeuXwGUCriLQjIAAaWYqFEKAAIG+BARIX/OlWgIECDQjMFyANCOvEAIECHQuIEA6n0DlEyBAoJaAAKklr18CwwkY8NYEBMjWZtR4CBAgsJKAAFkJWjcECBDYmoAA6WdGVUqAAIGmBARIU9OhGAIECPQjIED6mSuVEiBQS0C/BwUEyEEWOwkQIEDgKQEB8pSQ4wQIECBwUECAHGSxc14BrREgsEUBAbLFWTUmAgQIrCAgQFZA1gUBAgRqCSzZrwBZUlfbBAgQ2LCAANnw5BoaAQIElhQQIEvqart/ASMgQOBRAQHyKI0DBAgQIHBMQIAc03GMAAECBB4VWDhAHu3XAQIECBDoXECAdD6ByidAgEAtAQFSS16/BBYW0DyBpQUEyNLC2idAgMBGBQTIRifWsAgQILC0gAB5TNh+AgQIEDgqIECO8jhIgAABAo8JCJDHZOxfReDtt967a3ldBUEn9wW870RAgHQyUcokQIBAawICpLUZUQ8BAgQ6ERAgnUzUOWU6lwABAmsICJA1lPVBgACBDQoIkA1OqiERIFBLYKx+BchY8220BAgQmE1AgMxGqSECBAiMJSBAxprv1kerPgIEOhIQIB1NllIJECDQkoAAaWk21EKAAIFaAhf0K0AuQHMJAQIECOx2AsRvAQECBAhcJCBALmJzEYH7At4TGE9AgIw350ZMgACBWQQEyCyMGiFAgMB4Aq0EyHjyRkyAAIHOBQRI5xOofAIECNQSECC15PVLoBUBdRC4UECAXAjnMgIECIwu8PKr73zjpZbX0SfI+AkQGFfg9dd3L7W8egK5+ndTAwQIEBhTQICMOe9GTYAAgasFBMjVhBogQKCWgH7rCgiQuv56J0CAQLcCAqTbqVM4AQIE6goIkLr+dXvXO4F+BD6qlPqVZf34ss69fGRpMGt5ebDkHvklZe8S/ZZm7yyfXN59UVlbW1LXl5WiYlFeXiwPdrw4ZIsAAQIXC3xxufI7yvoxZd1fvry8+ZayfkRZz1ly/ueVCxIk5WXW5etKa1nLyy79fFrZeKmsWXKP/Myy8VS/uS7j+upy7v6S67697IhHeTm6fFw5+hllPWf5rHLyD+yt31q2z22jXHJ0SV2fU86IRXl5sTzY8eKQLQIECFwskBtnbsRZp0Y+umxMITDdoMuu6svbpYKs5WWXwMsTRwIh709dM55pfB+7d9Gnlu0YxKNs3i5zbeQe/p+lsV8o68+V9c/L+k1lTZ/lZdklnS/bg9YJEBhV4J/KwPPJNTfXsrnLzfT/d7td1vJys+Rmm6+mvqG8y6f0/Rt3vlb6irL/lbLmU/V/l9f9Jfty7OvLzk8o6/6ST825drpx53ieftJmzsvXMl9aNnIPzBNG1pz7BWVf2k2b+18n5VjaS5351F9Oe7BkXP9V9ub68nKzfHb5+c9l3V8+sbz52rKmrQTq5FN23VlSy+c+35O6p/5TV+p+fuj25YNl6x/LmkBJmJXNm+WTys+MJ1afXran5Vgd0zWpM31nbNN1t6+Hirg9aIMAAQJXCPxruTY33tzMy+YuN+m/LRvTDTNh8VXl/X+U9U/L+oVlzU2+vOxyXb6OScD8SdmRAEgAlc2bJTferylbf1bWvytrPnXv/50iN7zc6HMjLId3uaknMNJO3ufGnptsbroJk6zZ/4Hy43/K+g9l/beyZkmd+Yordf5L2ZEbcW6+ZfPBkloyzowxTzPp49/3zsp4EgRpP7VnDJ+/d3zazPjikUCIRb4ey7E/Kj/ikDbK5p0l9/OMM33HPgdzbmxSV/pLIOTp5FgduSZfu2Wsf1EaSR0JkbJ5d0mHd/d4R6ADASV2IfB/pcrchKYbVm5a7y/7piU3698ub/6yrNmfoMjNK/el3Ahz0/r9ciw37tz8pieQ3FDztPI75VhulLk55oacfsqumyV9p80ESG6oaTfn5TXt59zcnG9Ofv4j12RfniL+puybnhwSMqnzr8q+1Jo6piAqu+4sqSeBk9BMH6n9f/fOyLW/Wd6nlrSfr5xyXtl1u6TGhN17yp7UlLDLa8Ij7eU1gReHcsouTxXfWza+r6zfXNa0m/Mz7rTzx2Vf+kttCeo8FR6r4x3l/ARH1hi+t7w/uATy4AE7CRAgMINAnjhyA8xNLp/Ec2PbbzY3+G8rO76nrLnZ5eab+1I+4edmef/8ctou5+QGnieU6Q/IuTY37Ryf1oRKngYSXGkzAZAbb54KEk7TE8Z0/mOvHyoHspaXJ5c8+eQGnqefrH9/4IqE43eW/a+VNU8fUxCUt7s8RX1j2Ui4TmPPuPJV1veX/Rnvd5XXjCMOZXOXrwp/vmz8TFl/oqy5Lk8aOZ6x5+urXJc1T09pr5y2O1RHXFJDgj/nHF2DevQEBwkQIHCFQL6PzyfhfKr963vtJDxeLft+t6z5I3A+WZfN2yXX3b7Z28jNPF8z/XLZl5tm1h8v2/evz6fn3EBzo8xTRW6KCY+8z/VZy2WzLwmu6Wuf1LDfQUIlf/P59bLzrbLmiaa83C55GvnD8i4hkL+BlM1dnoDyBJZxZv3psvNny5qniPJyZ4lN+oxtAiRB9BvljFyXNQGTJ6Cn6jiSDaW158tJJz0/1wsBAgTOFcgNLE8huQkmTPavzyfh3PByI09Y5KliOp6vknITzKfh7Mu50yf1fCWUp4f8nSDX5fj0mu1pzQ02wZFP+XkqyHVZc3NP++l7Onf/NX+7yM13f98523nSypgSWBn//rUZU44lINJHxrV/PE9JCZU/KDvzNV1MUmue4LJddt8sh8abA2kzTyv5uir95NoEUfbn+HTdY3XkCSrX5GuuKR/ytJNrH6zTCQ8O2EGAAIGZBPLkkU/c92+muaknWPLVTL6/zw0yN7B0mxtgvrfPV1s/WHbkj8ZTAOXGn7+N5Enih8qxHP/u8jqFTdm8WdJ2Po3nbwq5qWdnvu7Jdbm55/39NV+bpYb8TSH/ldR0w71/3rH3qS+f8t934KRYfErZP9VcNu8suTY7EpAJkvxHBdnO34cyxlz3w+WE/I995eVmSbik3h8p73Is9cenvN3lbx5pM9flK6xYx+NYHak7XyHGNtdkXhJ4ae/OKkDucHhDYHGBUTrI10lZM97cyKfwSDAkTHKTy03pV8oJ+f8X8h1+/l+MXyvvcyzX/F7Z/qmy5uut7P+lsp3ry8sun65zbb7KyfF8HTQFTI5Pa2pIG9Ox3JTzddfUTs7LOVmznb5/tWykptSTGlPvdH6Op448VZXTbpfs3z8v480YckLazprtPBGl3neXN1nTR8KmvN2lzWk77/PH7/zxPu3kD9o/WXbmmnyFNbWXa94s+7MvX09lbPmPC9J/2b3La9qIQYzyNVbC81gdeXL7xXJxDLL+VtnO2DLGsvliESAvLGwRIFBHIDfp3CQP9Z6bVo4fOpZ9Tx3POeeu+cSer7oeq+nc9u6fP7Wf1/vHjr3P+ZfWlbHk2v32p/byur9/2s75uW56/+BVgDwgsYMAAQIEThHoLkBOGZRzCBAgQGB5gQ8DAAD//30qvxIAAAAGSURBVAMAoJcjRiJDT9oAAAAASUVORK5CYII=', diamond: 'data:image/png;base64,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', iron: 'data:image/png;base64,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',
+};
+let hatImgs = {};   // { id: HTMLImageElement }
+for (const id of HAT_IDS) {
+  const im = new Image();
+  im.src = HAT_DATA[id];
+  hatImgs[id] = im;
+}
+let appleBank = 0;        // 苹果总库（局外资源）
+let ownedHats = [];       // 永久拥有的帽子 id 数组
+let equippedHat = null;   // 当前装备的帽子 id（null = 不戴）
+/* ============ 自制帽子系统：可穿戴 + 可选颜色 + 可删除 ============ */
+let customHats = [];      // 自制帽子数组 [{ id, px }]；px = 400 个值（row-major 20×20），-1 透明 / 0..63 调色板索引
+let equippedCh = null;    // 当前装备的自制帽子 id（与普通帽 equippedHat 互斥）
+const HAT_PAL = [         // 画板 64 色调色板（按行 8 组 × 8 色）
+  '#ffffff','#f0f0f0','#cccccc','#999999','#666666','#444444','#222222','#000000',
+  '#ffe1e1','#ffb3b3','#ff7a7a','#ff3b30','#d70015','#a50000','#6d0000','#3b0000',
+  '#fff1cc','#ffe08a','#ffc94d','#ffb400','#ff9500','#e8590c','#b45309','#7c2d12',
+  '#fffde0','#fde68a','#facc15','#eab308','#ca8a04','#a16207','#854d0e','#713f12',
+  '#e6ffdb','#bef264','#84cc16','#4d7c0f','#15803d','#166534','#14532d','#0f3620',
+  '#e0f2fe','#7dd3fc','#38bdf8','#0284c7','#0369a1','#075985','#0c4a6e','#082f49',
+  '#eae6ff','#c4b5fd','#a78bfa','#8b5cf6','#7c3aed','#6d28d9','#5b21b6','#2e1065',
+  '#ffe4ec','#fbcfe8','#f472b6','#ec4899','#be185d','#9d174d','#701a3b','#4a051e',
+];
+/* —— 画板编辑器状态（state 'hatEdit'） —— */
+let chMode = 'new';       // new 新建 | edit 修改旧帽
+let chEditId = null;      // 修改模式下的自制帽子 id（new 模式为 null）
+let chGrid = [];          // 正在编辑的 400 个像素（-1 透明 / 0..63）
+let chTool = 'brush';     // 画笔 brush | 橡皮 eraser | 填充 fill
+let chColor = 0;          // 当前选中的调色板颜色索引
+let chFrom = 'settings';  // 画板从哪里进来：settings 设置 | hats 装饰页
+let chAskExit = false;    // 取消弹窗：是否保存帽子？（保存并退出/不保存直接退出/继续画）
+let chToast = null;       // 画板提示 { msg, color, t }
+let chSel = null;         // 装饰页「自制帽子」页：被点开选项菜单的帽子 id
+let chDel = null;         // 装饰页：正在确认删除的帽子 id
+let _chPaint = false;     // 是否正在画板上拖拽绘制
+let _chLast = null;       // 上一次绘制的单元格 {x,y}（用于连线）
+let chLeftTs = 0;         // 刚离开画板的时刻（毫秒）：抑制同一次点击的二次 click，防误触底部按钮
+/* 自制帽子 id 列表（顺序 = 显示顺序） */
+function chIds() { return customHats.map(h => h.id); }
+/* 自制帽子显示名：按顺序叫 自制帽1、自制帽2… */
+function chName(id) { const i = customHats.findIndex(h => h.id === id); return '自制帽' + (i + 1); }
+/* 画板空白检查：一笔都没画则不能保存 */
+function chGridBlank() { return chGrid.every(v => v === -1); }
+let ownedSkins  = ['green'];   // 永久拥有的皮肤 id（green 用默认，不抽）
+let equippedSkin = 'green';    // 当前装备的皮肤 id
+let ownedScenes = ['green'];   // 永久拥有的场景 id（green 默认，不抽）
+let equippedScene = 'green';   // 当前装备的场景 id
+let runApples = 0;        // 本局吃到的苹果数（结算时计入总库）
+let lastRunApples = 0;    // 最近一局的苹果数（死亡后保留用于结算界面显示）
+let hatPrompt = null;     // 装饰界面抽奖结果提示 { msg, color, t }
+let cheatSeq = '';        // 隐藏作弊：主菜单连按 a-d-a-d 的按键缓冲
+let cheatLast = 0;        // 隐藏作弊：上次按键的时间戳
+let settingsFrom = 'ready'; // 设置界面来源：ready 主菜单 | playing 游戏中
+let soundOn = true;        // 音效开关（吃苹果 / 死亡音效）
+let scanlineOn = true;     // 复古扫描线开关
+let resetAsk = false;      // 是否正在显示"重置数据"确认对话框
+/* 帽子内容外框缓存（提前声明：启动阶段就会为自制帽子生成图片） */
+let hatBBox = {};          // { id: {sx,sy,sw,sh} } 原图透明内容外框
+let hatBBoxCanvas = null;  // 用于读取像素的离屏 canvas
+const SOUND_KEY = 'rapid_snake_sound';   // 音效偏好存储键
+const SCAN_KEY  = 'rapid_snake_scan';    // 扫描线偏好存储键
+const TUTOR_DONE_KEY  = 'rapid_snake_tutordone';   // 引导完成标记（点过抽奖）
+const TUTOR_LATCH_KEY = 'rapid_snake_tutorlat';    // 曾攒到20苹果的锁存，保证只引导第一次
+
+/* 新手上路引导：第一次攒到20个苹果后，强制拉玩家点进装饰界面去抽奖一次 */
+let tutorDone = false;     // 引导是否已完成
+let tutorLatched = false;  // 是否曾持有过≥20苹果（锁存，只触发一次）
+
+// 当前是否处于引导中（已触发且尚未完成 → 主菜单挡住开始、装饰界面指到抽奖）
+function tutorOn() { return !tutorDone && tutorLatched; }
+// 每次主循环检测：苹果数首次到20就锁存引导
+function ensureTutorLatch() {
+  if (!tutorDone && !tutorLatched && appleBank >= 20) {
+    tutorLatched = true;
+    try { localStorage.setItem(TUTOR_LATCH_KEY, '1'); } catch (e) {}
+  }
+}
+// 玩家点了抽奖 → 引导完成，两个箭头消失、恢复可开始游戏
+function completeTutor() {
+  if (!tutorDone) {
+    tutorDone = true;
+    try { localStorage.setItem(TUTOR_DONE_KEY, '1'); } catch (e) {}
+  }
+}
+/* 浮动箭头：指向按钮用的上下浮动引导箭头（朝下，画在按钮上方） */
+function drawTutorArrow(cx, top, color) {
+  const bob = Math.sin(nowMs / 240) * 7;
+  const y = top + bob;
+  ctx.fillStyle = color;
+  // 方形柄（竖直矩形条）
+  ctx.fillRect(cx - 7, y, 14, 22);
+  // 朝下三角箭头
+  ctx.beginPath();
+  ctx.moveTo(cx - 12, y + 20);
+  ctx.lineTo(cx + 12, y + 20);
+  ctx.lineTo(cx, y + 36);
+  ctx.closePath();
+  ctx.fill();
+}
+
+try { appleBank = parseInt(localStorage.getItem(APPLES_KEY) || '0') || 0; } catch (e) { appleBank = 0; }
+try { ownedHats = JSON.parse(localStorage.getItem(HATS_KEY) || '[]') || []; } catch (e) { ownedHats = []; }
+try { equippedHat = localStorage.getItem(EQUIP_KEY) || null; } catch (e) { equippedHat = null; }
+try { ownedSkins = JSON.parse(localStorage.getItem(SKINS_KEY) || '["green"]') || ['green']; } catch (e) { ownedSkins = ['green']; }
+try { ownedScenes = JSON.parse(localStorage.getItem(SCENES_KEY) || '["green"]') || ['green']; } catch (e) { ownedScenes = ['green']; }
+try { equippedSkin = localStorage.getItem(EQUIP_SKIN) || 'green'; } catch (e) { equippedSkin = 'green'; }
+try { equippedScene = localStorage.getItem(EQUIP_SCENE) || 'green'; } catch (e) { equippedScene = 'green'; }
+try { tutorDone = localStorage.getItem(TUTOR_DONE_KEY) === '1'; } catch (e) { tutorDone = false; }
+try { tutorLatched = localStorage.getItem(TUTOR_LATCH_KEY) === '1'; } catch (e) { tutorLatched = false; }
+/* —— 自制帽子数据加载：像素数组 + 装备，并生成图片 —— */
+try {
+  const raw = JSON.parse(localStorage.getItem(CH_KEY) || '[]');
+  customHats = (Array.isArray(raw) ? raw : []).filter(h => h && Array.isArray(h.px) && h.px.length === CH_CELLS * CH_CELLS)
+    .slice(0, CH_MAX).map(h => ({ id: String(h.id), px: h.px.slice() }));
+} catch (e) { customHats = []; }
+try { equippedCh = localStorage.getItem(CH_EQUIP) || null; } catch (e) { equippedCh = null; }
+if (equippedCh && !customHats.some(h => h.id === equippedCh)) equippedCh = null;
+if (equippedCh) equippedHat = null;                 // 装备自制帽时卸下普通帽（互斥）
+if (equippedHat) equippedCh = null;
+/* 为每顶自制帽子生成图像（供帽子页缩略图与蛇头穿戴渲染共用） */
+for (const h of customHats) chMakeImg(h.id, h.px);
+/* 确保装备的一定在已拥有列表里，默认项始终存在 */
+if (ownedSkins.indexOf('green') < 0) ownedSkins.unshift('green');
+if (ownedScenes.indexOf('green') < 0) ownedScenes.unshift('green');
+if (ownedSkins.indexOf(equippedSkin) < 0) equippedSkin = 'green';
+if (ownedScenes.indexOf(equippedScene) < 0) equippedScene = 'green';
+function saveHatData() {
+  try { localStorage.setItem(APPLES_KEY, String(appleBank)); } catch (e) {}
+  try { localStorage.setItem(HATS_KEY, JSON.stringify(ownedHats)); } catch (e) {}
+  try { localStorage.setItem(CH_KEY, JSON.stringify(customHats.map(h => ({ id: h.id, px: h.px })))); } catch (e) {}
+  try { localStorage.setItem(SKINS_KEY, JSON.stringify(ownedSkins)); } catch (e) {}
+  try { localStorage.setItem(SCENES_KEY, JSON.stringify(ownedScenes)); } catch (e) {}
+  try { if (equippedHat) localStorage.setItem(EQUIP_KEY, equippedHat); else localStorage.removeItem(EQUIP_KEY); } catch (e) {}
+  try { if (equippedCh) localStorage.setItem(CH_EQUIP, equippedCh); else localStorage.removeItem(CH_EQUIP); } catch (e) {}
+  try { localStorage.setItem(EQUIP_SKIN, equippedSkin); } catch (e) {}
+  try { localStorage.setItem(EQUIP_SCENE, equippedScene); } catch (e) {}
+}
+
+/* ============ 设置：音效 / 扫描线偏好（持久化到 localStorage） ============ */
+try { soundOn = localStorage.getItem(SOUND_KEY) !== '0'; } catch (e) { soundOn = true; }
+try { scanlineOn = localStorage.getItem(SCAN_KEY) !== '0'; } catch (e) { scanlineOn = true; }
+function applyScanline() {
+  const el = document.getElementById('scan');
+  if (el) el.style.display = scanlineOn ? '' : 'none';
+}
+function setSound(on) {
+  soundOn = !!on;
+  try { localStorage.setItem(SOUND_KEY, soundOn ? '1' : '0'); } catch (e) {}
+}
+function setScanline(on) {
+  scanlineOn = !!on;
+  try { localStorage.setItem(SCAN_KEY, scanlineOn ? '1' : '0'); } catch (e) {}
+  applyScanline();
+}
+applyScanline();
+
+/* 重置全部游戏数据：分数、苹果、已拥有/装备的所有装饰（保留音效/扫描线偏好） */
+function resetAllData() {
+  try { localStorage.removeItem(BEST_KEY); } catch (e) {}
+  try { localStorage.removeItem(BEST_KEY_LEGACY); } catch (e) {}
+  try { localStorage.removeItem(APPLES_KEY); } catch (e) {}
+  try { localStorage.removeItem(HATS_KEY); } catch (e) {}
+  try { localStorage.removeItem(CH_KEY); } catch (e) {}
+  try { localStorage.removeItem(CH_EQUIP); } catch (e) {}
+  try { localStorage.removeItem(EQUIP_KEY); } catch (e) {}
+  try { localStorage.removeItem(SKINS_KEY); } catch (e) {}
+  try { localStorage.removeItem(SCENES_KEY); } catch (e) {}
+  try { localStorage.removeItem(EQUIP_SKIN); } catch (e) {}
+  try { localStorage.removeItem(EQUIP_SCENE); } catch (e) {}
+  try { localStorage.removeItem(TUTOR_DONE_KEY); } catch (e) {}
+  try { localStorage.removeItem(TUTOR_LATCH_KEY); } catch (e) {}
+  best = 0;
+  appleBank = 0;
+  ownedHats = [];
+  equippedHat = null;
+  customHats = [];
+  equippedCh = null;
+  ownedSkins = ['green'];
+  ownedScenes = ['green'];
+  equippedSkin = 'green';
+  equippedScene = 'green';
+  tutorDone = false;
+  tutorLatched = false;
+  hatBBox = {};        // 清掉帽子外框缓存
+  chToast = null; chAskExit = false;
+}
+
+/* ============ 工具函数 ============ */
+function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+
+/* 十六进制颜色混色：a 为底色，向 b 过渡 t（0~1） */
+function blendHex(a, b, t) {
+  const ia = parseInt(a.slice(1), 16), ib = parseInt(b.slice(1), 16);
+  const r = Math.round((ia >> 16 & 255) + ((ib >> 16 & 255) - (ia >> 16 & 255)) * t);
+  const g = Math.round((ia >> 8 & 255) + ((ib >> 8 & 255) - (ia >> 8 & 255)) * t);
+  const bl = Math.round((ia & 255) + ((ib & 255) - (ia & 255)) * t);
+  return '#' + ((1 << 24) + (r << 16) + (g << 8) + bl).toString(16).slice(1);
+}
+
+/* 随机"空隙"格数（从 4 / 8 / 12 中随机；平台行差 = 空隙 + 1） */
+function randGap() {
+  return GAP_CHOICES[Math.floor(Math.random() * GAP_CHOICES.length)];
+}
+
+/* ============ 平台生成（世界格坐标） ============
+ * 平台 = 6 格宽 × 1 格高的方块，属于固定的世界地形（世界坐标不变）。
+ * 视觉滚动 = 镜头向下移动（camR 递增），画面顶对应的世界行就是 camR。
+ * 尖刺：平台上每一格独立按概率生成（可在任意格、一个平台可有多个刺）；
+ * 但每连续 3 个"带刺平台"之后，强制生成一个完全无刺的平台。
+ * 返回 { c, r, w, h, spikes }  spikes: 平台顶面上的尖刺
+ */
+let spikeStreak = 0;              // 连续带刺平台数（无刺平台会打断累计）
+let forceNoSpike = false;         // 下一次生成的平台强制不带刺
+
+function makePlatform(r) {
+  const c = Math.floor(Math.random() * (GRID_W - PLAT_W));   // 水平位置随机
+  const spikes = [];
+  const prob = Math.min(SPIKE_MAX, SPIKE_BASE + (demoOn ? demoTime : gameTime) * SPIKE_ACCEL);   // 每格概率
+  let hasSpike = false;
+  if (!forceNoSpike) {
+    // 平台上每一格（含最左/最右）独立判定是否带刺
+    for (let col = 0; col < PLAT_W; col++) {
+      if (Math.random() < prob) {
+        spikes.push({ col, px: (c + col) * CELL + CELL / 2 });   // px: 刺中心X（世界像素）
+        hasSpike = true;
+      }
+    }
+  }
+  // 连续 3 个带刺平台后，下一个强制无刺；无刺平台出现会打断累计（重新计数）
+  if (forceNoSpike) {
+    forceNoSpike = false;         // 本次为强制无刺的平台
+    spikeStreak = 0;
+  } else if (hasSpike) {
+    spikeStreak++;
+    if (spikeStreak >= 3) forceNoSpike = true;   // 连续 3 个带刺 → 下一个强制无刺
+  } else {
+    spikeStreak = 0;              // 无刺平台打断累计
+  }
+  return { c, r, w: PLAT_W, h: PLAT_H, spikes };
+}
+
+/* 初始铺满一批平台（camR=0 时覆盖整屏及屏幕下方） */
+function buildInitialPlatforms() {
+  const arr = [];
+  let r = -1;
+  while (r < GRID_H + 2) {
+    arr.push(makePlatform(r));
+    r += randGap() + 1;           // 行差 = 空隙(4/8/12) + 平台自身高度 1
+  }
+  return arr;
+}
+
+/* ============ 镜头向下推进一格（无限世界，平台只当地形、从不推蛇） ============
+ * 平台、苹果、蛇都是世界坐标，镜头下移只改 camR：
+ * - 底部：保证镜头能看到的地方都有平台，不断向下生成新地形；
+ * - 顶部：已滚出镜头视野的平台销毁；
+ * - 苹果滚出视野顶部即消失。
+ */
+function stepWorld() {
+  camR += 1;   // 镜头向下走一格 = 原“所有内容上移一格”的视觉效果
+  // 底部持续生成新平台（像刺一样：平台生成时，若场上没有苹果就带上一个）
+  const bottom = platforms[platforms.length - 1];
+  if (bottom.r - camR < GRID_H) {
+    const np = makePlatform(bottom.r + randGap() + 1);   // 行差 = 空隙(4/8/12) + 平台自身高度 1
+    platforms.push(np);
+    if (apple === null) attachAppleTo(np);
+  }
+  // 顶部销毁已滚出镜头视野的平台（苹果随之消失）
+  while (platforms.length && platforms[0].r + platforms[0].h <= camR) {
+    if (apple && apple.plat === platforms[0]) apple = null;
+    platforms.shift();
+  }
+  // 苹果滚出视野顶部 → 消失（世界中的苹果不动，只是镜头过去了）
+  if (apple && apple.r < camR) apple = null;
+}
+
+/* ============ 蛇的出生：横着躺在屏幕中部的一个平台上 ============ */
+function placeSnake() {
+  let target = null;
+  for (const p of platforms) {
+    if (p.r > 8 && p.r < 30) { target = p; break; }
+  }
+  if (!target) target = platforms[Math.floor(platforms.length / 2)];
+  target.spikes.length = 0;       // 清除出生平台上的尖刺，保证安全出生
+
+  const hr = target.r - 1;        // 蛇头格 = 平台上方一格（底部贴着平台顶面）
+  const hc = target.c + 2;        // 平台左缘起第 3 格
+  snake = [
+    { c: hc, r: hr },             // 蛇头
+    { c: hc + 1, r: hr }          // 蛇身第 1 节（横在蛇头右侧）
+  ];
+  headDir = 'left';
+  growPending = 0;
+  fallTimer = 0;
+  fallInterval = FALL_START;
+  if (apple === null) attachAppleTo(target);   // 出生平台带上苹果，一开局就能看见
+}
+
+/* ============ 开始 / 重新开始 ============ */
+function startGame() {
+  demoOn = false;              // 停止主菜单背景演示
+  demoDead = false;
+  gameTime = 0;
+  score = 0;
+  runApples = 0;              // 本局苹果计数清零（结算时计入总库）
+  scrollSpeed = SCROLL_BASE;
+  scrollAcc = 0;
+  camR = 0;                   // 镜头回到世界顶部
+  tapCd = TAP_INTERVAL;       // 点按/长按冷却置满，开局按下即可立刻走
+  holdCd = HOLD_INTERVAL;
+  squash = 0;
+  trailFx = [];
+  spikeStreak = 0;            // 刺计数清零（每3个带刺平台后必有无刺）
+  forceNoSpike = false;
+  apple = null;               // 苹果由新生成的平台带上（像刺一样随平台生成）
+  platforms = buildInitialPlatforms();
+  placeSnake();
+  state = 'playing';
+}
+
+/* 放弃本局（设置界面里的"放弃游戏"）：不结算分数，直接回主菜单并重启背景演示 */
+function abandonGame() {
+  clearInputState();
+  settingsFrom = 'ready';
+  goReady();
+}
+
+/* ============ 死亡处理 ============ */
+function die() {
+  if (state !== 'playing') return;
+  state = 'dead';
+  deathAt = nowMs;
+  sndDeath();   // 播放死亡音效
+  newRecord = false;
+  if (score > best) {
+    best = score;
+    newRecord = true;
+    try { localStorage.setItem(BEST_KEY, String(best)); } catch (e) {}
+  }
+  // 本局吃到的苹果计入局外"苹果总库"（抽帽子资源），每死一局结算一次
+  lastRunApples = runApples;
+  appleBank += runApples;
+  runApples = 0;
+  saveHatData();
+}
+
+/* ============ 吃苹果音效：内置 MP3（data URI，无外部文件） ============ */
+let _eatAudio = null;
+function playEatSound() {
+  if (!soundOn) return;              // 音效开关：关闭时不吃苹果音效
+  try {
+    if (!_eatAudio) {
+      _eatAudio = new Audio('data:audio/mpeg;base64,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');
+      _eatAudio.volume = 0.5;
+    }
+    if (_eatAudio.paused) { const _p = _eatAudio.play(); if (_p && _p.catch) _p.catch(function(){}); }
+  } catch (_) {}
+}
+
+/* ============ 音效：Web Audio 实时合成（无需外部音频文件） ============ */
+let _actx = null;
+function sndCtx() {
+  if (!_actx) { try { _actx = new (window.AudioContext || window.webkitAudioContext)(); } catch (_) {} }
+  if (_actx && _actx.state === 'suspended') { try { _actx.resume(); } catch (_) {} }
+  return _actx;
+}
+/* 死亡音效：8-bit 风格"womp"——方波快速下滑 + 兜底短促 buzz，复古坠落感 */
+function sndDeath() {
+  if (!soundOn) return;              // 音效开关：关闭时不出死亡音效
+  const c = sndCtx(); if (!c) return;
+  let t = c.currentTime;
+  const master = c.createGain();
+  master.gain.value = 0.28;
+  master.connect(c.destination);
+  // 主"womp"：方波 520→70Hz，约 0.3 秒滑落
+  const o1 = c.createOscillator(); o1.type = 'square';
+  o1.frequency.setValueAtTime(520, t);
+  o1.frequency.exponentialRampToValueAtTime(70, t + 0.32);
+  const g1 = c.createGain();
+  g1.gain.setValueAtTime(0.5, t);
+  g1.gain.exponentialRampToValueAtTime(0.001, t + 0.34);
+  o1.connect(g1); g1.connect(master);
+  o1.start(t); o1.stop(t + 0.36);
+  // 兜底"buzz"：锯齿波 210→50Hz，更短更急促，强化坠落感
+  t += 0.05;
+  const o2 = c.createOscillator(); o2.type = 'sawtooth';
+  o2.frequency.setValueAtTime(210, t);
+  o2.frequency.exponentialRampToValueAtTime(50, t + 0.18);
+  const g2 = c.createGain();
+  g2.gain.setValueAtTime(0.30, t);
+  g2.gain.exponentialRampToValueAtTime(0.001, t + 0.20);
+  o2.connect(g2); g2.connect(master);
+  o2.start(t); o2.stop(t + 0.22);
+}
+
+/* ============ 位置 (c, r) 是否有"有效支撑" ============
+ * - 正下方一格是平台顶面 → 站在平台上，有支撑
+ * - 或正下方一格是自己的蛇身节（蛇头踩在身体上）→ 只要这条蛇身里
+ *   有任意一节被平台托住（整条身体链被平台拉住），蛇头就站得住；
+ *   只有整条蛇都悬空、没有一节搭在平台上时，才允许蛇整体下落。
+ */
+function hasSupport(c, r) {
+  // 1) 正下方一格是平台顶面 → 站在平台上
+  for (const p of platforms) {
+    if (r + 1 === p.r && c >= p.c && c < p.c + p.w) return true;
+  }
+  // 2) 正下方一格是自己的蛇身节（踩在身体上）
+  let underBody = false;
+  for (let i = 1; i < snake.length; i++) {
+    if (snake[i].r === r + 1 && snake[i].c === c) { underBody = true; break; }
+  }
+  if (!underBody) return false;
+  // 蛇身链上只要存在被平台承托的节（骑在平台顶 / 陷在平台内被托住），
+  // 整条身体就被平台拉住，蛇头不会带着身体凭空下坠、把平台段撕开
+  for (let i = 1; i < snake.length; i++) {
+    const s = snake[i];
+    for (const p of platforms) {
+      if (s.r + 1 === p.r && s.c >= p.c && s.c < p.c + p.w) return true;             // 该节骑在平台顶
+      if (s.c >= p.c && s.c < p.c + p.w && s.r >= p.r && s.r < p.r + p.h) return true; // 该节陷在平台内
+    }
+  }
+  return false;
+}
+
+/* ============ 蛇的移动：蛇头点一下走一格（只允许 上/左/右）；成功返回 true，被挡返回 false ============ */
+function moveSnake(dc, dr) {
+  if ((state !== 'playing' && !demoOn) || !snake.length) return false;
+  // 0) 禁止 180° 掉头：蛇头朝左时不能直接向右（要先转上/下，蛇身让开再走）
+  if ((dc < 0 && headDir === 'right') || (dc > 0 && headDir === 'left')) return false;
+  const h = snake[0];
+  const nc = h.c + dc;
+  const nr = h.r + dr;
+
+  // 1) 屏幕左右边界
+  if (nc < 0 || nc >= GRID_W) return false;
+
+  // 2) 平台是实心的，蛇头不能走进平台格子
+  for (const p of platforms) {
+    if (nc < p.c + p.w && nc > p.c - 1 &&
+        nr < p.r + p.h && nr > p.r - 1) return false;
+  }
+
+  // 3) 不能穿过自己的蛇身（含尾巴：蛇头不能进入任何一节蛇身所在的格子）
+  for (let i = 1; i < snake.length; i++) {
+    if (snake[i].c === nc && snake[i].r === nr) return false;
+  }
+
+  // 通过检查 → 蛇头前进一格；蛇头离开的旧格立即变成一节蛇身，最末尾的蛇身消失
+  // （若吃到苹果待生长：不消失末尾，蛇变长一节）
+  snake.unshift({ c: nc, r: nr });   // 蛇头前进，旧蛇头自然退为第一节蛇身
+  if (growPending > 0) growPending--;      // 生长中：保留尾巴（长一节）
+  else snake.pop();                        // 平常：最末尾的蛇身消失一节
+  if (dc < 0) headDir = 'left';
+  else if (dc > 0) headDir = 'right';
+  else if (dr < 0) headDir = 'up';
+  return true;
+}
+
+/* ============ 蛇的移动：悬空时蛇头自动逐格下落（越掉越快），身体随之队列跟随 ============ */
+function stepDown() {
+  const nx = snake[0].c, nr = snake[0].r + 1;
+  // 蛇头正下方正好被自己的身体占着（垂直悬挂的蛇链）→ 整条一起下落一格，
+  // 保持蛇的形态（不会蛇头掉进自己身体里）
+  let downBlocked = false;
+  for (let i = 1; i < snake.length; i++) {
+    if (snake[i].c === nx && snake[i].r === nr) { downBlocked = true; break; }
+  }
+  if (downBlocked) {
+    for (const s of snake) s.r += 1;
+    // 兜底：某节若因此陷入平台格，把它顶回原位（不穿平台）
+    for (let i = 1; i < snake.length; i++) {
+      for (const p of platforms) {
+        if (snake[i].c >= p.c && snake[i].c < p.c + p.w &&
+            snake[i].r >= p.r && snake[i].r < p.r + p.h) { snake[i].r -= 1; break; }
+      }
+    }
+  } else {
+    // 蛇头向下走一格：旧格立即变成蛇身（unshift 后旧蛇头自然退为第一节），
+    // 最末尾一节消失；影子队列保证蛇身始终连着蛇头、不会断开
+    snake.unshift({ c: nx, r: nr });
+    if (growPending > 0) growPending--;   // 吃到苹果待生长：保留尾巴
+    else snake.pop();                     // 平常：最末尾的蛇身消失
+  }
+  headDir = 'down';   // 蛇头朝下：下落途中左右都可以自由转向（不会被当成"掉头"挡掉）
+  // 落到平台顶面或有效的蛇身垫脚上 → 着落，停止下落
+  if (hasSupport(snake[0].c, snake[0].r)) {
+    fallTimer = 0;
+    fallInterval = FALL_START;
+    squash = 1;                                       // 着落压扁反馈
+  }
+}
+
+/* ============ 每帧更新蛇 ============ */
+function updateSnake(dt) {
+  const h = snake[0];
+
+  // 1) 悬空时逐格下落
+  if (!hasSupport(h.c, h.r)) {
+    fallTimer += dt;
+    if (fallTimer >= fallInterval) {
+      fallTimer = 0;
+      fallInterval = Math.max(0.05, fallInterval * 0.88);   // 间隔越来越短 = 越掉越快
+      stepDown();
+      if (snake[0].r - camR > GRID_H + 2) { onSnakeDeath(); return; }  // 掉出屏幕底部（演示与对局统一处理：对局结束、演示等重生）
+    }
+  } else {
+    fallTimer = 0;   // 蛇头有支撑：计时清零
+  }
+
+  // 2) 尖刺碰撞：蛇头或任何一节蛇身碰到尖刺 → 游戏结束
+  for (const p of platforms) {
+    for (const sp of p.spikes) {
+      const baseY = p.r * CELL;
+      const tip = { x: sp.px, y: baseY - SPIKE_H };
+      const b1  = { x: sp.px - SPIKE_HW, y: baseY };
+      const b2  = { x: sp.px + SPIKE_HW, y: baseY };
+      for (const s of snake) {
+        const sx = s.c * CELL + CELL / 2, sy = s.r * CELL + CELL / 2;
+        if (circleVsTriangle(sx, sy, SEG_R, tip, b1, b2)) { onSnakeDeath(); return; }
+      }
+    }
+  }
+
+  // 4) 吃苹果：蛇头走到苹果格 → +5 分并标记待生长（下次蛇头移动/下落时尾不消、长一节）
+  if (apple && snake[0].c === apple.c && snake[0].r === apple.r) {
+    if (!demoOn) { score += 5; runApples += 1; playEatSound(); }   // 演示模式只吃不长分、不存档、不出声
+    growPending = 1;
+    apple = null;
+    // 苹果被吃后，下一个新生成的平台会带上新苹果
+  }
+
+  // 4) 死亡判定：蛇被镜头追上滚出屏幕顶部（蛇行小于镜头所在行）
+  if (snake[0].r < camR) { onSnakeDeath(); }
+}
+
+/* ============ 穿模/重合兜底：每帧最后（绘制前）执行 ============
+ * 1) 蛇节若与平台格重叠 → 顶到平台顶面上方最近的空格（不穿进其它蛇身节）
+ * 2) 若仍有任意两节同格（理论不该发生）→ 把靠后的一节向上移出，杜绝重合
+ */
+function resolvePenetration() {
+  for (let i = 0; i < snake.length; i++) {
+    const s = snake[i];
+    for (const p of platforms) {
+      if (s.c >= p.c && s.c < p.c + p.w && s.r >= p.r && s.r < p.r + p.h) {
+        for (let rr = p.r - 1; rr > p.r - 12; rr--) {
+          if (!snake.some((o, j) => j !== i && o.c === s.c && o.r === rr)) { s.r = rr; break; }
+        }
+        break;
+      }
+    }
+  }
+  for (let i = 1; i < snake.length; i++) {
+    const s = snake[i];
+    let clash = false;
+    for (let j = 0; j < i; j++) {
+      if (snake[j].c === s.c && snake[j].r === s.r) { clash = true; break; }
+    }
+    if (!clash) continue;
+    for (let rr = s.r - 1; rr > s.r - 12; rr--) {
+      if (!snake.some(o => o.c === s.c && o.r === rr)) { s.r = rr; break; }
+    }
+  }
+}
+
+/* ============ 苹果（像刺一样：平台生成时就带上苹果） ============ */
+function attachAppleTo(p) {
+  // 该平台带刺的列（相对列），苹果绝不落在有刺的那一格
+  const spikeCols = p.spikes.map(sp => sp.col);
+  const free = [];
+  for (let col = 0; col < p.w; col++) if (spikeCols.indexOf(col) < 0) free.push(col);
+  if (free.length === 0) { apple = null; return; }   // 整块平台都带刺：这轮不放苹果，等下一个平台
+  const r = p.r - 1;   // 苹果位于平台顶面上方一格
+  for (let tries = 0; tries < 20; tries++) {
+    const c = p.c + free[Math.floor(Math.random() * free.length)];  // 只在无刺列里挑
+    if (snake.some(s => s.c === c && s.r === r)) continue;          // 不和蛇重迭
+    apple = { c, r, plat: p };
+    return;
+  }
+  // 蛇占满无刺列才兜底：仍从无刺列里随机挑
+  const c = p.c + free[Math.floor(Math.random() * free.length)];
+  apple = { c, r, plat: p };
+}
+
+/* ============ 圆 vs 三角形 精确碰撞 ============ */
+function sign(px, py, ax, ay, bx, by) {
+  return (bx - ax) * (py - ay) - (by - ay) * (px - ax);
+}
+function pointInTri(px, py, ax, ay, bx, by, cx, cy) {
+  const d1 = sign(px, py, ax, ay, bx, by);
+  const d2 = sign(px, py, bx, by, cx, cy);
+  const d3 = sign(px, py, cx, cy, ax, ay);
+  const hasNeg = d1 < 0 || d2 < 0 || d3 < 0;
+  const hasPos = d1 > 0 || d2 > 0 || d3 > 0;
+  return !(hasNeg && hasPos);
+}
+function segDist(px, py, ax, ay, bx, by) {
+  const dx = bx - ax, dy = by - ay;
+  const l2 = dx * dx + dy * dy;
+  let t = l2 > 0 ? ((px - ax) * dx + (py - ay) * dy) / l2 : 0;
+  t = Math.max(0, Math.min(1, t));
+  const cx = ax + t * dx, cy = ay + t * dy;
+  return Math.hypot(px - cx, py - cy);
+}
+function circleVsTriangle(cx, cy, cr, tip, b1, b2) {
+  if (pointInTri(cx, cy, tip.x, tip.y, b1.x, b1.y, b2.x, b2.y)) return true;
+  if (segDist(cx, cy, tip.x, tip.y, b1.x, b1.y) <= cr) return true;
+  if (segDist(cx, cy, b1.x, b1.y, b2.x, b2.y) <= cr) return true;
+  if (segDist(cx, cy, b2.x, b2.y, tip.x, tip.y) <= cr) return true;
+  return false;
+}
+
+/* ============ 主更新循环 ============ */
+function update(dt) {
+  squash = Math.max(0, squash - dt * 5.5);
+  // 主菜单背景：自动演示游玩（纯表演，不记分不吃存档）
+  if (state === 'ready' && demoOn) { demoUpdate(dt); return; }
+  if (state !== 'playing') return;
+  gameTime += dt;
+  score += dt;                    // 时间记分：每生存 1 秒 +1 分
+  scrollSpeed = Math.min(SCROLL_MAX, SCROLL_BASE + gameTime * SCROLL_ACCEL);
+  // 镜头向下滚动：每帧最多推进 1 格（世界固定，镜头走；蛇不被镜头推）
+  scrollAcc += scrollSpeed * dt;
+  if (scrollAcc >= CELL) {
+    scrollAcc -= CELL;
+    stepWorld();          // 1) 镜头下移一格 + 地形维护（生成/销毁）
+  }
+  // 2) 蛇头移动
+  //    点按（pendingMove）：连点最多每 1/6 秒一格（tapCd）
+  //    长按（heldDir）：按住持续移动每 1/4 秒一格（holdCd）
+  if (pendingMove) {
+    tapCd += dt;
+    if (tapCd >= TAP_INTERVAL) {
+      tapCd = 0;
+      moveSnake(pendingMove[0], pendingMove[1]);
+      pendingMove = null;
+    }
+  } else if (heldDir) {
+    holdCd += dt;
+    if (holdCd >= HOLD_INTERVAL) {
+      holdCd = 0;
+      moveSnake(heldDir[0], heldDir[1]);
+    }
+  } else {
+    // 无输入：冷却缓慢回满，保证下一次按键能立刻响应
+    tapCd = Math.min(TAP_INTERVAL, tapCd + dt);
+    holdCd = Math.min(HOLD_INTERVAL, holdCd + dt);
+  }
+  updateSnake(dt);          // 3) 蛇头下落（悬空时逐格下落）、刺/苹果/死亡判定
+  resolvePenetration();     // 4) 绘制前的穿模/重合兜底
+  // 蛇头拖尾残影记录
+  if (snake.length) {
+    const hx = snake[0].c * CELL + CELL / 2, hy = snake[0].r * CELL + CELL / 2;
+    trailFx.push({ x: hx, y: hy });
+    if (trailFx.length > 14) trailFx.shift();
+  }
+}
+
+/* ============ 主菜单背景自动演示 ============
+ * 蛇会像真人一样在主菜单背景自动游玩：固定速度向下滚动、主动追苹果、
+ * 躲避尖刺与屏幕边缘；死亡后稍作停顿自动重生。纯观赏，不记分、不碰存档。
+ */
+let demoOn = false;       // 是否正在自动演示
+let demoDead = false;     // 演示蛇已死亡（短暂停顿等重生）
+let demoDeadAt = 0;       // 演示死亡时刻（毫秒）
+let demoTime = 0;         // 演示运行秒数（供尖刺概率参考）
+let demoT = 0;            // 自动决策计时
+const DEMO_SCROLL = 40;   // 演示镜头滚动速度 px/s（固定 2 格/秒，玩家选定的匀速）
+const DEMO_STEP = 0.20;   // 自动决策间隔（≈游戏内点按的走格节奏）
+
+/* 统一回主菜单入口：回主菜单就启动背景演示 */
+function goReady() {
+  clearInputState();
+  resetAsk = false;
+  settingsFrom = 'ready';
+  hatPrompt = null;
+  state = 'ready';
+  startDemo();
+}
+/* 关闭设置界面：来自对局→继续对局；来自主菜单→回主菜单（重启演示） */
+function closeSettings() {
+  clearInputState();
+  resetAsk = false;
+  if (settingsFrom === 'playing') state = 'playing';
+  else goReady();
+}
+/* 启动一局全新的演示：重建世界与出生蛇（不动任何存档数据） */
+function startDemo() {
+  if (state !== 'ready') return;
+  demoOn = true;
+  demoDead = false;
+  demoTime = 0;
+  demoT = 0;
+  camR = 0;
+  scrollAcc = 0;
+  apple = null;
+  spikeStreak = 0;        // 尖刺连续计数复位（每 3 个带刺平台后必有无刺）
+  forceNoSpike = false;
+  trailFx = [];
+  platforms = buildInitialPlatforms();
+  placeSnake();
+}
+/* 演示蛇死亡：进入"停顿等重生"，而不是结束游戏 */
+function onSnakeDeath() {
+  if (demoOn && state === 'ready') {
+    demoDead = true;
+    demoDeadAt = nowMs;
+  } else {
+    die();
+  }
+}
+/* 演示主更新：固定速度滚动 + 自动决策 + 复用真实下落/吃苹果/死亡判定 */
+function demoUpdate(dt) {
+  if (!demoOn || state !== 'ready') return;
+  if (demoDead) {                                   // 死亡后短暂停顿再重生
+    if (nowMs - demoDeadAt > 700) {
+      demoDead = false;
+      startDemo();
+    }
+    return;
+  }
+  scrollAcc += DEMO_SCROLL * dt;                    // 恒定匀速（玩家选定）
+  while (scrollAcc >= CELL) { scrollAcc -= CELL; stepWorld(); }
+  demoTime += dt;
+  demoT += dt;
+  if (demoT >= DEMO_STEP) {                         // 固定节奏做决定
+    demoT = 0;
+    demoSteer();
+  }
+  updateSnake(dt);                                  // 下落/吃苹果/死亡判定（演示分支不结算）
+  resolvePenetration();
+}
+
+/* —— 演示 AI：自动走位 —— */
+/* (c,r) 正下方被哪块平台的顶面托着（有支撑则返回该平台） */
+function platUnder(c, r) {
+  for (const p of platforms) if (p.r === r + 1 && c >= p.c && c < p.c + p.w) return p;
+  return null;
+}
+/* 平台 p 的 c 列是否带尖刺 */
+function pSpikedAt(p, c) { return p.spikes.some(s => p.c + s.col === c); }
+/* 平台 p 上离 prefer 最近的无刺列；若整块带刺则回最左列（兜底） */
+function safeColOn(p, prefer) {
+  let bc = -1, bd = 1e9;
+  for (let i = 0; i < p.w; i++) {
+    const cc = p.c + i;
+    if (pSpikedAt(p, cc)) continue;
+    const d = Math.abs(cc - prefer);
+    if (d < bd) { bd = d; bc = cc; }
+  }
+  return bc >= 0 ? bc : p.c;
+}
+/* 顶面行 ≥ r 的最近一块平台（用于判定"即将落到哪"） */
+function firstPlatAtOrBelow(r) {
+  let bp = null;
+  for (const p of platforms) if (p.r >= r && (!bp || p.r < bp.r)) bp = p;
+  return bp;
+}
+/* 走一格（失败静默，由物理自然兜底） */
+function demoMove(dc) { if (dc) moveSnake(dc, 0); }
+/* 反向被挡时：向上"抬一下"立刻落回，从而调转方向 */
+function demoPivot() { moveSnake(0, -1); }
+
+/* 悬空时想去哪一列（优先追下方可见的苹果，否则向画面中间看齐） */
+function demoAirGoal(h) {
+  if (apple && apple.r > h.r && apple.r - camR < GRID_H) return apple.c;
+  const p = firstPlatAtOrBelow(h.r + 1);
+  return p ? safeColOn(p, h.c) : -1;
+}
+/* 平台 ride 上蛇头能否一路走到左/右边缘（沿途不得有尖刺挡路） */
+function rideExitOK(ride, h, side) {
+  const cols = ride.spikes.map(s => ride.c + s.col);
+  if (side < 0) return !cols.some(c => c >= ride.c && c < h.c);
+  return !cols.some(c => c > h.c && c < ride.c + ride.w);
+}
+/* 站在平台上时：选出走哪边的边缘去下坠（优先朝苹果方向，被刺封就换边） */
+function demoExitDir(ride, h) {
+  const leftD = h.c - ride.c, rightD = ride.c + ride.w - 1 - h.c;
+  let pref = 0;                                   // 偏好方向
+  if (apple && apple.r > h.r && apple.r - h.r < 18) pref = apple.c > h.c ? 1 : (apple.c < h.c ? -1 : 0);
+  else pref = (GRID_W >> 1) > h.c ? 1 : ((GRID_W >> 1) < h.c ? -1 : 0);
+  const canL = rideExitOK(ride, h, -1), canR = rideExitOK(ride, h, 1);
+  if (pref > 0 && canR) return 1;                 // 想去右边且能走 → 右
+  if (pref < 0 && canL) return -1;
+  if (canL && canR) return pref !== 0 ? -pref : (leftD <= rightD ? -1 : 1);   // 偏好被挡，走另一边
+  if (canL) return -1;
+  if (canR) return 1;
+  return pref >= 0 ? 1 : -1;                      // 两边都被刺封：任选（注定会死，只是时间问题）
+}
+/* 一次自动决策：挑一列，走或停留 */
+function demoSteer() {
+  const h = snake[0];
+  if (!h || !snake.length || state !== 'ready') return;
+  const ride = platUnder(h.c, h.r);
+  if (!ride) {
+    // —— 悬空：往目标列修正 ——
+    let goal = demoAirGoal(h);
+    const about = platUnder(h.c, h.r + 1);          // 再落一格就会踩到的顶面
+    if (about && pSpikedAt(about, h.c)) goal = safeColOn(about, h.c);   // 有刺先避
+    if (goal < 0) return;
+    if (goal > h.c) demoMove(1);
+    else if (goal < h.c) demoMove(-1);
+    return;
+  }
+  // —— 站在平台上 ——
+  const rowsLeft = h.r - camR;                      // 蛇头距画面顶的行数（越小越危险）
+  const tryChase = apple && apple.r === h.r &&
+                   apple.c >= ride.c && apple.c < ride.c + ride.w &&
+                   rowsLeft > 10;                   // 时间富余才去追本平台的苹果
+  if (tryChase) {
+    const nc = apple.c > h.c ? h.c + 1 : (apple.c < h.c ? h.c - 1 : h.c);
+    const rev = (apple.c > h.c && headDir === 'left') || (apple.c < h.c && headDir === 'right');
+    if (rev) { demoPivot(); return; }               // 想回头吃：先抬一下掉头
+    if (nc !== h.c && nc >= ride.c && nc < ride.c + ride.w && !pSpikedAt(ride, nc)) {
+      demoMove(apple.c > h.c ? 1 : -1);
+      return;
+    }
+    // 苹果被刺/边缘挡住吃不到 → 放弃，转入下坠（不停留）
+  }
+  // 下坠：往能走通的一边走，走出平台边缘自然落到下一层
+  let dc = demoExitDir(ride, h);
+  // 时间很紧时直接走最近的边缘，别管方向偏好
+  if (rowsLeft < 12) {
+    const nl = rideExitOK(ride, h, -1), nr = rideExitOK(ride, h, 1);
+    const leftD = h.c - ride.c, rightD = ride.c + ride.w - 1 - h.c;
+    if (nl && (!nr || leftD <= rightD)) dc = -1;
+    else if (nr) dc = 1;
+  }
+  // 反向约束：不能掉头 → 抬一下，下个决策再走
+  if ((dc > 0 && headDir === 'left') || (dc < 0 && headDir === 'right')) { demoPivot(); return; }
+  // 贴边时若外侧是画面边界且平台另一边能走，就抬一下转去另一边
+  const ncol = h.c + dc;
+  if ((ncol < 0 || ncol >= GRID_W) && rideExitOK(ride, h, -dc)) { demoPivot(); return; }
+  demoMove(dc);
+}
+
+/* ============ 绘制 ============ */
+function draw() {
+  const scene = SCENE_META[equippedScene] || SCENE_META.green;
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, scene.bg[0]);
+  g.addColorStop(1, scene.bg[1]);
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+
+  // —— 世界层：世界固定，镜头向下走一格 = 画面内容上移一格 ——
+  ctx.save();
+  ctx.translate(0, -camR * CELL);
+
+  // 平台
+  for (const p of platforms) drawPlatform(p);
+
+  // 蛇头拖尾残影
+  for (let i = 0; i < trailFx.length; i++) {
+    const pt = trailFx[i], f = (i + 1) / trailFx.length;
+    ctx.globalAlpha = 0.22 * f;
+    ctx.fillStyle = scene.trail;
+    ctx.fillRect(pt.x - CELL / 2, pt.y - CELL / 2, CELL, CELL);
+  }
+  ctx.globalAlpha = 1;
+
+  // 苹果
+  if (apple) drawApple(apple);
+
+  // 蛇
+  drawSnake();
+
+  // 尖刺（画在最后，保证刺尖可见）
+  for (const p of platforms) {
+    for (const sp of p.spikes) drawSpike(p.r * CELL, sp.px);
+  }
+
+  // 帽子（画在世界层最上方：永远显示在蛇头上面一格，重叠时置顶）
+  drawHatOnHead();
+
+  ctx.restore();
+
+  // —— 屏幕层（HUD / 覆盖层不随镜头移动） ——
+  if (state === 'playing' || state === 'dead') drawHUD();
+  if (state === 'ready') drawReady();
+  else if (state === 'hats') drawHatScreen();
+  else if (state === 'hatEdit') drawHatEditScreen();
+  else if (state === 'settings') drawSettings();
+  else if (state === 'dead') drawGameOver();
+}
+
+/* 平台：整块绿色方块 + 亮色顶面线（无内部格线） */
+function drawPlatform(p) {
+  const x = p.c * CELL, y = p.r * CELL, w = p.w * CELL, h = p.h * CELL;
+  const pl = (SCENE_META[equippedScene] || SCENE_META.green).plat;
+  ctx.fillStyle = pl.body;
+  ctx.fillRect(x, y, w, h);
+  ctx.fillStyle = pl.top;                        // 顶面（可落脚表面）
+  ctx.fillRect(x, y, w, 2);
+  ctx.fillStyle = pl.bot;                        // 底部暗线
+  ctx.fillRect(x, y + h - 2, w, 2);
+}
+
+/* 苹果：红色小圆 + 高光 + 小茎 */
+function drawApple(a) {
+  const x = a.c * CELL + CELL / 2, y = a.r * CELL + CELL / 2;
+  ctx.save();
+  ctx.shadowColor = '#ff4d3d';
+  ctx.shadowBlur = 8;
+  ctx.fillStyle = '#ff5148';
+  ctx.beginPath();
+  ctx.arc(x, y, 7, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.fillStyle = 'rgba(255,255,255,0.55)';
+  ctx.beginPath();
+  ctx.arc(x - 2.5, y - 2.5, 2, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = '#7a5c1f';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(x, y - 7);
+  ctx.lineTo(x + 2, y - 10);
+  ctx.stroke();
+  ctx.restore();
+}
+
+/* 蛇：像素连体风——
+ * 蛇身节与节紧贴、连成一条（统一绿色、去缝隙、去条纹），
+ * 深色像素描边只画在“外侧”（相邻节之间不描边），上表面一条浅色高光，
+ * 蛇头略深、带朝向移动方向的方块像素眼。
+ */
+function drawSnake() {
+  let C = (SKIN_META[equippedSkin] || SKIN_META.green).colors;
+  // 浅色场景：描边太深会在亮背景下透出一圈"黑边"，改为向蛇身色靠拢
+  const scene = SCENE_META[equippedScene] || SCENE_META.green;
+  if (scene.light) {
+    C = { ...C, line: blendHex(C.body, C.line, 0.1) };
+  }
+  const PX = 2;                                    // 像素单位（描边/高光/瞳孔均为 PX 整数倍）
+  // 判断 (c,r) 是否被其它蛇节占据（用于“是否相连/是否开放面”）
+  const hasSeg = (c, r, skip) => {
+    for (let k = 0; k < snake.length; k++) {
+      if (k !== skip && snake[k].c === c && snake[k].r === r) return true;
+    }
+    return false;
+  };
+  // 画一节；ox,oy 为渲染偏移（蛇头压扁时使用局部坐标）
+  const seg = (s, i, isHead, ox, oy) => {
+    const x = s.c * CELL + ox, y = s.r * CELL + oy;
+    const up = hasSeg(s.c, s.r - 1, i), dn = hasSeg(s.c, s.r + 1, i);
+    const le = hasSeg(s.c - 1, s.r, i), ri = hasSeg(s.c + 1, s.r, i);
+    // 底色（满格铺满 → 相邻节之间无缝隙、连成一体）
+    ctx.fillStyle = isHead ? C.head : C.body;
+    ctx.fillRect(x, y, CELL, CELL);
+    // 像素描边：只画开放的外侧面
+    ctx.fillStyle = C.line;
+    if (!up) ctx.fillRect(x, y, CELL, PX);
+    if (!dn) ctx.fillRect(x, y + CELL - PX, CELL, PX);
+    if (!le) ctx.fillRect(x, y, PX, CELL);
+    if (!ri) ctx.fillRect(x + CELL - PX, y, PX, CELL);
+    // 上表面高光：只有上表面开放时画（水平段连成一条顶部亮线）
+    if (!up) {
+      ctx.fillStyle = C.hi;
+      ctx.fillRect(x + PX, y + PX, CELL - PX * 2, PX);
+    }
+    // 蛇头：方块像素眼（眼白 6px + 瞳孔 3px，朝向移动方向）
+    if (isHead) {
+      const cx = x + CELL / 2, cy = y + CELL / 2;
+      const horiz = (headDir === 'left' || headDir === 'right');
+      const fx = headDir === 'left' ? -1 : headDir === 'right' ? 1 : 0;
+      const fy = headDir === 'up' ? -1 : headDir === 'down' ? 1 : 0;
+      const centers = horiz
+        ? [[fx * 5, -6], [fx * 5, 6]]           // 左右朝向：两眼下上排列
+        : [[-6, fy * 5], [6, fy * 5]];          // 上下朝向：两眼左右排列
+      for (const [dx, dy] of centers) {
+        const ex = cx + dx - 3, ey = cy + dy - 3;   // 眼白左上角（6×6）
+        ctx.fillStyle = C.eye;
+        ctx.fillRect(ex, ey, 6, 6);
+        ctx.fillStyle = C.pupil;
+        ctx.fillRect(ex + (fx > 0 ? 3 : fx < 0 ? 0 : 1),
+                     ey + (fy > 0 ? 3 : fy < 0 ? 0 : 1), 3, 3);
+      }
+    }
+  };
+  // 蛇身（从尾画到头），整格绝对坐标
+  for (let i = snake.length - 1; i >= 1; i--) seg(snake[i], i, false, 0, 0);
+  // 蛇头（着落压扁效果 + 局部坐标）
+  if (snake.length) {
+    const h = snake[0];
+    ctx.save();
+    ctx.translate(h.c * CELL + CELL / 2, h.r * CELL + CELL / 2);
+    ctx.scale(1 + squash * 0.3, 1 - squash * 0.3);   // 压扁 → 复原
+    ctx.translate(-CELL / 2, -CELL / 2);
+    seg(h, 0, true, -h.c * CELL, -h.r * CELL);   // 抵消绝对坐标：在局部原点画，变换只做压扁
+    ctx.restore();
+  }
+}
+
+/* 帽子内容不透明外框（按 HAT_IDS 缓存，裁剪透明边距，让帽子贴合蛇头；hatBBox 已在顶部声明） */
+function computeHatBBox(img) {
+  if (!hatBBoxCanvas) hatBBoxCanvas = document.createElement('canvas');
+  const w = img.naturalWidth, h = img.naturalHeight;
+  if (!w || !h) return null;
+  hatBBoxCanvas.width = w; hatBBoxCanvas.height = h;
+  const c2 = hatBBoxCanvas.getContext('2d', { willReadFrequently: true });
+  c2.clearRect(0, 0, w, h);
+  c2.drawImage(img, 0, 0);
+  let d;
+  try { d = c2.getImageData(0, 0, w, h).data; } catch (e) { return null; }
+  let minX = w, minY = h, maxX = -1, maxY = -1;
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      if (d[(y * w + x) * 4 + 3] > 8) {
+        if (x < minX) minX = x; if (x > maxX) maxX = x;
+        if (y < minY) minY = y; if (y > maxY) maxY = y;
+      }
+    }
+  }
+  if (maxX < 0) return null;
+  return { sx: minX, sy: minY, sw: maxX - minX + 1, sh: maxY - minY + 1 };
+}
+
+/* ============ 画帽子：裁剪内容并按蛇头朝向旋转（帽子在蛇头后方，底部朝前进方） ============ */
+function drawHatOnHead() {
+  const hatId = equippedCh || equippedHat;      // 自制帽与普通帽互斥，二选一
+  if (!hatId || !snake.length || !hatImgs[hatId] || !hatImgs[hatId].complete) return;
+  const img = hatImgs[hatId];
+  if (!hatBBox[hatId]) hatBBox[hatId] = computeHatBBox(img);
+  const box = hatBBox[hatId];
+  const h = snake[0];
+  const dir = (typeof headDir === 'string' && headDir.length) ? headDir : 'right';
+  // 帽子位置：蛇头反方向一格（后方）；旋转使"底部"朝前进方向
+  const BACK_OFF = { up: [0, 1], down: [0, -1], left: [1, 0], right: [-1, 0] };
+  const ROT = { up: Math.PI, right: -Math.PI / 2, down: 0, left: Math.PI / 2 };
+  const o = BACK_OFF[dir] || [0, -1];
+  ctx.imageSmoothingEnabled = false;
+  if (!box) {
+    // 无法读取像素时退回：画在蛇头后方一格（整图铺满）
+    ctx.drawImage(img, (h.c + o[0]) * CELL, (h.r + o[1]) * CELL, CELL, CELL);
+    ctx.imageSmoothingEnabled = true;
+    return;
+  }
+  // 数轴：帽子底部落在蛇头上"由行进反方向边缘向内 1/3"那条线上。
+  // 锚点从蛇头中心再往反方向退 1/6 格 = 距反方向边缘 1/2 - 1/6 = 1/3 格。
+  const ang = (dir in ROT) ? ROT[dir] : 0;
+  const dW = CELL, dH = dW * (box.sh / box.sw);
+  const ax = h.c * CELL + CELL / 2 + (o[0] * CELL) / 6;   // 锚点 = 距反方向边缘 1/3 格
+  const ay = h.r * CELL + CELL / 2 + (o[1] * CELL) / 6;
+  ctx.save();
+  ctx.translate(ax, ay);      // 旋转原点放在此锚点
+  ctx.rotate(ang);
+  ctx.drawImage(img, box.sx, box.sy, box.sw, box.sh, -dW / 2, -dH, dW, dH); // 底部(y=0)=锚点线
+  ctx.restore();
+  ctx.imageSmoothingEnabled = true;
+}
+
+/* 尖刺：红色醒目三角形（立在平台顶面上） */
+function drawSpike(baseY, sx) {
+  ctx.fillStyle = '#ff5b4d';
+  ctx.strokeStyle = '#7a1f17';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(sx, baseY - SPIKE_H);
+  ctx.lineTo(sx - SPIKE_HW, baseY);
+  ctx.lineTo(sx + SPIKE_HW, baseY);
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+}
+
+/* 文本配色：按当前场景亮/暗返回一套前景色（亮背景用深色字、暗背景用浅色字） */
+function uiPalette() {
+  const light = !!(SCENE_META[equippedScene] || SCENE_META.green).light;
+  return light ? {
+    accent: '#a67c00',                  // 强调色（速度/开始键等）
+    strong: '#181818',                  // 主要文字
+    dim:    'rgba(25,25,25,0.72)',      // 次要文字
+    faint:  'rgba(40,40,40,0.55)',      // 最次要文字
+    title:  '#3f7d1d',                  // 菜单标题（深绿）
+    body:   '#2c3a26',                  // 菜单正文
+    hint:   'rgba(60,80,60,0.55)',      // 底部小字
+  } : {
+    accent: '#ffd93d',
+    strong: '#f0f6ee',
+    dim:    'rgba(160,200,170,0.75)',
+    faint:  'rgba(160,200,170,0.6)',
+    title:  '#9fdc6b',
+    body:   '#e8ffe0',
+    hint:   'rgba(160,180,160,0.5)',
+  };
+}
+
+/* HUD：左上角滚动速度 + 右上角实时分数 + 历史最高分 + 蛇长 */
+function drawHUD() {
+  const P = uiPalette();
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+  ctx.fillStyle = P.accent;
+  ctx.font = 'bold 22px "Courier New", monospace';
+  ctx.fillText('SPD ' + (scrollSpeed / CELL).toFixed(1), 16, 14);
+  ctx.textAlign = 'right';
+  ctx.textBaseline = 'top';
+  ctx.fillStyle = P.strong;
+  ctx.font = 'bold 22px "Courier New", monospace';
+  ctx.fillText('SCORE ' + score.toFixed(1), W - 16, 14);
+  ctx.fillStyle = P.dim;
+  ctx.font = 'bold 13px "Courier New", monospace';
+  ctx.fillText('BEST ' + best.toFixed(1), W - 16, 42);
+  ctx.fillStyle = P.faint;
+  ctx.font = '12px "Courier New", monospace';
+  ctx.fillText('LEN ' + snake.length, W - 16, 62);
+}
+
+/* 设置界面：音效 / 扫描线开关、返回（游戏内还有放弃游戏）在顶部均匀排布，
+ * 重置数据按钮固定在底部——绘制 + 点击共用同一组坐标 */
+function settingsGeometry() {
+  const w = 320, h = 44, cx = W / 2;
+  const items = [];
+  let y = H / 2 - 132;
+  items.push({ key: 'sound', x: cx - w / 2, y, w, h });  y += h + 14;
+  items.push({ key: 'scan',  x: cx - w / 2, y, w, h });  y += h + 14;
+  items.push({ key: 'back',  x: cx - w / 2, y, w, h });  y += h + 14;
+  if (settingsFrom === 'playing') {
+    items.push({ key: 'giveup', x: cx - w / 2, y, w, h });
+  }
+  return { items, reset: { key: 'reset', x: cx - w / 2, y: H - 86, w, h } };
+}
+/* 重置确认弹窗的按钮区域（绘制 + 点击共用；两个按钮并排置于画布内） */
+function confirmLayout() {
+  const w = 150, hh = 40, cx = W / 2, cy = H / 2;
+  return {
+    title: cy - 60,
+    text:  cy - 30,
+    yes:   { x: cx - w - 10, y: cy, w, h: hh },   // 左："确定"
+    no:    { x: cx + 10,     y: cy, w, h: hh }    // 右："取消"
+  };
+}
+/* 通用卡片式按钮底 */
+function drawButtonCard(rect) {
+  ctx.fillStyle = 'rgba(30,52,36,0.92)';
+  ctx.strokeStyle = 'rgba(160,220,120,0.8)';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.roundRect(rect.x, rect.y, rect.w, rect.h, 8);
+  ctx.fill();
+  ctx.stroke();
+}
+/* 带主文案 + 可选的底部小字说明 */
+function drawButton(rect, label, accent, sub) {
+  drawButtonCard(rect);
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = accent;
+  ctx.font = 'bold 16px "Courier New", monospace';
+  ctx.fillText(label, rect.x + rect.w / 2, sub ? rect.y + 18 : rect.y + rect.h / 2);
+  if (sub) {
+    ctx.fillStyle = 'rgba(210,250,225,0.7)';
+    ctx.font = '11px "Courier New", monospace';
+    ctx.fillText(sub, rect.x + rect.w / 2, rect.y + rect.h - 8);
+  }
+}
+/* 右侧开关拨片：音效 / 扫描线 */
+function drawToggle(rect, label, on) {
+  drawButtonCard(rect);
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#e8ffe0';
+  ctx.font = 'bold 15px "Courier New", monospace';
+  ctx.fillText(label, rect.x + 14, rect.y + rect.h / 2);
+  const tw = 56, th = 24, tx = rect.x + rect.w - tw - 14, ty = rect.y + (rect.h - th) / 2;
+  ctx.fillStyle = on ? '#5dbb62' : '#7a7f78';
+  ctx.beginPath();
+  ctx.roundRect(tx, ty, tw, th, th / 2);
+  ctx.fill();
+  ctx.fillStyle = '#ffffff';
+  ctx.font = 'bold 13px "Courier New", monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText(on ? '开' : '关', tx + tw / 2, ty + th / 2);
+}
+/* 重置数据确认对话框（覆盖层） */
+function drawResetConfirm() {
+  ctx.fillStyle = 'rgba(0,0,0,0.55)';
+  ctx.fillRect(0, 0, W, H);
+  const C = confirmLayout();
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#ffb0a0';
+  ctx.font = 'bold 16px "Courier New", monospace';
+  ctx.fillText('确定要清除所有进度吗？', W / 2, C.title);
+  ctx.fillStyle = 'rgba(225,225,225,0.75)';
+  ctx.font = '12px "Courier New", monospace';
+  ctx.fillText('最高分、苹果数和已拥有/装备的装饰都将清空', W / 2, C.text);
+  drawButton(C.yes, '确 定', '#ff5b4d');
+  drawButton(C.no, '取 消', '#9fdc6b');
+}
+function drawSettings() {
+  ctx.fillStyle = 'rgba(2,6,4,0.88)';
+  ctx.fillRect(0, 0, W, H);
+  // 标题
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#9fdc6b';
+  ctx.font = 'bold 30px "Courier New", monospace';
+  ctx.fillText('设 置', W / 2, 74);
+  ctx.fillStyle = 'rgba(210,250,225,0.6)';
+  ctx.font = '13px "Courier New", monospace';
+  ctx.fillText(settingsFrom === 'playing' ? '（游戏已暂停）' : '主菜单', W / 2, 104);
+  // 功能项（均匀排布）
+  const geo = settingsGeometry();
+  for (const it of geo.items) {
+    if (it.key === 'sound')        drawToggle(it, '🔊 音效', soundOn);
+    else if (it.key === 'scan')    drawToggle(it, '▦ 复古扫描线', scanlineOn);
+    else if (it.key === 'back') {
+      const backLabel = settingsFrom === 'playing' ? '继续游戏' : '返回主菜单';
+      drawButton(it, backLabel, '#ffd93d', isTouch ? undefined : '按 ESC');
+    } else if (it.key === 'giveup') {
+      drawButton(it, '放弃游戏', '#ff8a5b', '重新开始');
+    }
+  }
+  // 重置游戏数据固定在界面底部
+  drawButton(geo.reset, '⚠ 重置游戏数据', '#ff8a5b');
+  // 底部提示
+  ctx.fillStyle = 'rgba(210,250,225,0.5)';
+  ctx.font = '12px "Courier New", monospace';
+  ctx.textAlign = 'center';
+  if (!isTouch) ctx.fillText('按 ESC 关闭设置', W / 2, H - 16);
+  if (resetAsk) drawResetConfirm();
+}
+
+/* 主菜单界面（待机）：空格开始；背景全透明直接露出场景，文字颜色随场景亮暗自适应 */
+function drawReady() {
+  const P = uiPalette();
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = P.title;
+  ctx.font = 'bold 40px "Courier New", monospace';
+  ctx.fillText('RAPID SNAKE', W / 2, H / 2 - 120);
+  ctx.fillStyle = P.body;
+  ctx.font = 'bold 17px "Courier New", monospace';
+  ctx.fillText(isTouch ? '← → ↑ 滑动移动蛇' : '← → ↑ 或 A / D / W  移动蛇', W / 2, H / 2 - 60);
+  ctx.fillStyle = P.dim;
+  ctx.font = 'bold 15px "Courier New", monospace';
+  ctx.fillText('最高分  ' + best.toFixed(1), W / 2, H / 2 + 48);
+  if (Math.floor(nowMs / 400) % 2 === 0) {
+    ctx.fillStyle = P.accent;
+    ctx.font = 'bold 22px "Courier New", monospace';
+    ctx.fillText(isTouch ? '点击开始' : '按 空格 开始', W / 2, H / 2 + 115);
+  }
+  // 苹果总库（局外资源）
+  ctx.textAlign = 'left';
+  ctx.fillStyle = P.body;
+  ctx.font = 'bold 15px "Courier New", monospace';
+  ctx.fillText('🍎 ' + appleBank, 16, 14);
+  // 当前装备提示
+  {
+    ctx.textAlign = 'right';
+    ctx.fillStyle = P.dim;
+    ctx.font = 'bold 14px "Courier New", monospace';
+    const parts = [];
+    if (equippedCh) parts.push(chName(equippedCh));              // 自制帽优先显示
+    else if (equippedHat) parts.push(HAT_META[equippedHat].name);
+    parts.push(SKIN_META[equippedSkin].name);
+    parts.push(SCENE_META[equippedScene].name);
+    ctx.fillText('装备: ' + parts.join(' · '), W - 16, 14);
+  }
+  // 右下角"帽子"按钮
+  drawMenuHatButton();
+  // 左下角"设置"按钮
+  drawMenuSettingsButton();
+  // 新手上路引导：第一次攒到20苹果时，箭头指向"装饰"按钮，挡住开始游戏
+  if (tutorOn()) {
+    drawTutorArrow(W - 67, H - 122, '#ffd93d');
+  }
+}
+
+/* 主菜单左下角：设置按钮（点击或按 ESC 进入设置界面），尺寸与装饰按钮一致 */
+function menuBtnSettings() {
+  return { x: 16, y: H - 66, w: 102, h: 52 };
+}
+/* 主菜单右下角：装饰（帽子）按钮 */
+function menuBtnHat() {
+  return { x: W - 118, y: H - 66, w: 102, h: 52 };
+}
+function drawMenuSettingsButton() {
+  const R = menuBtnSettings();
+  ctx.fillStyle = 'rgba(30,52,36,0.92)';
+  ctx.strokeStyle = 'rgba(160,220,120,0.8)';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.roundRect(R.x, R.y, R.w, R.h, 8);
+  ctx.fill();
+  ctx.stroke();
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#ffd93d';
+  ctx.font = 'bold 16px "Courier New", monospace';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('设置', R.x + R.w / 2, R.y + 26);
+  if (!isTouch) {
+    ctx.fillStyle = 'rgba(210,250,225,0.7)';
+    ctx.font = '11px "Courier New", monospace';
+    ctx.fillText('按 ESC', R.x + R.w / 2, R.y + 44);
+  }
+}
+
+/* 主菜单右下角：帽子按钮（点击或按 B 进入帽子界面） */
+function drawMenuHatButton() {
+  const R = menuBtnHat();
+  ctx.fillStyle = 'rgba(30,52,36,0.92)';
+  ctx.strokeStyle = 'rgba(160,220,120,0.8)';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.roundRect(R.x, R.y, R.w, R.h, 8);
+  ctx.fill();
+  ctx.stroke();
+  // 按钮文字（居中）
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#ffd93d';
+  ctx.font = 'bold 16px "Courier New", monospace';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('装饰', R.x + R.w / 2, R.y + 26);
+  if (!isTouch) {
+    ctx.fillStyle = 'rgba(210,250,225,0.7)';
+    ctx.font = '11px "Courier New", monospace';
+    ctx.fillText('按 B', R.x + R.w / 2, R.y + 44);
+  }
+}
+
+/* 游戏结束界面 */
+function drawGameOver() {
+  ctx.fillStyle = 'rgba(10,4,4,0.80)';
+  ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#ff5b4d';
+  ctx.font = 'bold 42px "Courier New", monospace';
+  ctx.fillText('GAME OVER', W / 2, H / 2 - 120);
+  ctx.fillStyle = '#e8ffe0';
+  ctx.font = 'bold 22px "Courier New", monospace';
+  ctx.fillText('得分  ' + score.toFixed(1), W / 2, H / 2 - 50);
+  ctx.fillStyle = '#9fd8c0';
+  ctx.font = 'bold 16px "Courier New", monospace';
+  ctx.fillText('最高分  ' + best.toFixed(1), W / 2, H / 2 - 8);
+  // 额外标明本局获得的苹果数（计入局外总库，可用来抽帽子）
+  ctx.fillStyle = 'rgba(210,250,225,0.9)';
+  ctx.font = 'bold 15px "Courier New", monospace';
+  ctx.fillText('🍎 本局苹果  ' + lastRunApples, W / 2, H / 2 + 66);
+  if (newRecord) {
+    ctx.fillStyle = '#ffd93d';
+    ctx.font = 'bold 18px "Courier New", monospace';
+    ctx.fillText('★ 新纪录！', W / 2, H / 2 + 30);
+  }
+  if (Math.floor(nowMs / 400) % 2 === 0) {
+    ctx.fillStyle = '#ffd93d';
+    ctx.font = 'bold 20px "Courier New", monospace';
+    ctx.fillText(isTouch ? '点击返回主菜单' : '按 空格 返回主菜单', W / 2, H / 2 + 110);
+  }
+}
+
+/* ============ 装饰界面（color state 'hats'） ============
+ * - 顶部三个标签：皮肤 / 场景 / 帽子（帽子标签显示已拥有/总数），切换查看与装备
+ * - 苹果总库 + 剩几件可抽
+ * - 每个类别只显示"已拥有"的卡片（默认绿蛇/黑绿场景也在其中），每行固定 4 个
+ * - 底部"抽一次 20 苹果"；从共用奖池抽取未拥有的装饰，抽完即止
+ */
+function decorGeometry() {
+  const tabW = 92, tabGap = 8;
+  const tabsTotal = 4 * tabW + 3 * tabGap;
+  const tabStartX = (W - tabsTotal) / 2;
+  const tabs = [
+    { key: 'skin',  w: tabW, x: tabStartX,                           label: '皮肤 (' + ownedSkins.length + '/' + SKIN_IDS.length + ')' },
+    { key: 'scene', w: tabW, x: tabStartX + (tabW + tabGap),         label: '场景 (' + ownedScenes.length + '/' + SCENE_IDS.length + ')' },
+    { key: 'hat',   w: tabW, x: tabStartX + 2 * (tabW + tabGap),     label: '帽子 (' + ownedHats.length + '/' + HAT_IDS.length + ')' },
+    { key: 'ch',    w: tabW, x: tabStartX + 3 * (tabW + tabGap),     label: '自制 (' + customHats.length + '/' + CH_MAX + ')' },
+  ];
+  const list = ownedOf(decorTab);
+  // 卡片固定每行 4 个、共 3 行，在底部按钮上方区域内垂直居中
+  const gap = 12, topY = 152, cols = 4, rows = 3;
+  const areaH = (H - 104 - 8) - topY;      // 卡片可用高度（drawBtn.y=H-104，下方留 8px 间距）
+  const n = list.length, cards = [];
+  if (n > 0) {
+    const cw = Math.floor((W - 24 - (cols - 1) * gap) / cols);
+    let ch = Math.floor((areaH - (rows - 1) * gap) / rows);
+    ch = Math.min(ch, 150);
+    const totalW = cols * cw + (cols - 1) * gap;
+    const totalH = rows * ch + (rows - 1) * gap;
+    const startX = Math.floor((W - totalW) / 2);
+    const startY = topY + Math.floor((areaH - totalH) / 2);
+    for (let i = 0; i < n; i++) {
+      const row = Math.floor(i / cols), col = i % cols;
+      cards.push({ id: list[i], x: startX + col * (cw + gap), y: startY + row * (ch + gap), w: cw, h: ch });
+    }
+  }
+  const drawBtn = { x: W / 2 - 110, y: H - 104, w: 220, h: 48 };
+  return { tabs, cards, drawBtn };
+}
+/* 卡片内的内容预览：帽子/自制帽子→图；皮肤→迷你蛇；场景→迷你背景+平台 */
+function drawDecorPreview(cat, id, x, y, w, h) {
+  ctx.save();
+  ctx.beginPath();
+  ctx.roundRect(x, y, w, h, 6);
+  ctx.clip();
+  if (cat === 'hat' || cat === 'ch') {
+    if (hatImgs[id] && hatImgs[id].complete) {
+      ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(hatImgs[id], x, y, w, h);
+      ctx.imageSmoothingEnabled = true;
+    }
+  } else if (cat === 'skin') {
+    const C = (SKIN_META[id] || SKIN_META.green).colors;
+    ctx.fillStyle = 'rgba(10,18,12,0.5)';
+    ctx.fillRect(x, y, w, h);
+    const cx = x + w / 2, cy = y + h / 2;
+    const u = Math.min(w, h) / 8;
+    ctx.fillStyle = C.body;
+    ctx.fillRect(cx - 2.5 * u, cy - u, u * 5, 2 * u);          // 蛇身
+    ctx.fillStyle = C.hi;
+    ctx.fillRect(cx - 2.5 * u, cy - u, u * 5, 2);              // 高光
+    ctx.fillStyle = C.line;
+    ctx.fillRect(cx - 2.5 * u, cy - u, 2, 2 * u);
+    ctx.fillRect(cx - 2.5 * u, cy + u, u * 5, 2);
+    ctx.fillStyle = C.head;
+    ctx.fillRect(cx + 2.5 * u, cy - u, u, 2 * u);              // 头部
+    ctx.fillStyle = C.eye;
+    ctx.fillRect(cx + 2.8 * u, cy - 0.8 * u, 0.4 * u, 0.4 * u);
+  } else { // scene
+    const s = SCENE_META[id] || SCENE_META.green;
+    const gg = ctx.createLinearGradient(0, y, 0, y + h);
+    gg.addColorStop(0, s.bg[0]); gg.addColorStop(1, s.bg[1]);
+    ctx.fillStyle = gg;
+    ctx.fillRect(x, y, w, h);
+    ctx.fillStyle = s.plat.body;
+    ctx.fillRect(x + w * 0.12, y + h * 0.58, w * 0.76, h * 0.26);
+    ctx.fillStyle = s.plat.top;
+    ctx.fillRect(x + w * 0.12, y + h * 0.58, w * 0.76, 3);
+    ctx.fillStyle = s.plat.bot;
+    ctx.fillRect(x + w * 0.12, y + h * 0.82, w * 0.76, 3);
+  }
+  ctx.restore();
+}
+/* 移动端装饰界面：左上角返回主菜单按钮（绘制 + 点击共用坐标） */
+function hatBackBtn() {
+  return { x: 10, y: 10, w: 76, h: 34 };
+}
+function drawHatBackButton() {
+  const b = hatBackBtn();
+  ctx.fillStyle = 'rgba(36,60,40,0.75)';
+  ctx.strokeStyle = 'rgba(140,200,110,0.7)';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.roundRect(b.x, b.y, b.w, b.h, 8);
+  ctx.fill(); ctx.stroke();
+  ctx.fillStyle = '#e8ffe0';
+  ctx.font = 'bold 14px "Courier New", monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('← 返回', b.x + b.w / 2, b.y + b.h / 2);
+}
+/* —— 自制帽子页：点帽子弹出的选项菜单 / 删除确认面板（坐标） —— */
+function chOptLayout() {
+  const w = 232, bw = w - 56, cx = W / 2;
+  const PH = 268, y0 = 268;                 // 面板与 4 个按钮等距：上下留白一致（各 22px）
+  const rows = [
+    { key: 'wear',   y: y0 + 22 },
+    { key: 'edit',   y: y0 + 22 + 60 },
+    { key: 'del',    y: y0 + 22 + 120 },
+    { key: 'cancel', y: y0 + 22 + 180 },
+  ];
+  for (const r of rows) r.x = cx - bw / 2, r.w = bw, r.h = 44;
+  return { x: cx - w / 2, y: y0, w, rows };
+}
+function chDelLayout() {
+  const w = 150, hh = 40, cx = W / 2;
+  return {
+    title: H / 2 - 78,
+    text:  H / 2 - 48,
+    yes:   { x: cx - w - 10, y: H / 2, w, h: hh },   // 左：删除
+    no:    { x: cx + 10,     y: H / 2, w, h: hh }    // 右：取消
+  };
+}
+function drawChOptMenu(id) {
+  ctx.fillStyle = 'rgba(0,0,0,0.55)';
+  ctx.fillRect(0, 0, W, H);
+  const g = chOptLayout();
+  ctx.fillStyle = 'rgba(10,20,13,0.98)';
+  ctx.strokeStyle = 'rgba(255,217,61,0.9)';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.roundRect(g.x, g.y, g.w, 268, 12);
+  ctx.fill(); ctx.stroke();
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  const cur = equippedCh === id;
+  for (const r of g.rows) {
+    let label = r.key === 'wear' ? (cur ? '✓ 穿戴中' : '穿戴') :
+                r.key === 'edit' ? '修改' :
+                r.key === 'del' ? '删除' : '取消';
+    const hot = r.key === 'del';
+    ctx.fillStyle = hot ? 'rgba(120,40,32,0.9)' : 'rgba(46,92,54,0.95)';
+    ctx.strokeStyle = hot ? '#ff8a7a' : 'rgba(180,250,130,0.9)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.roundRect(r.x, r.y, r.w, r.h, 8);
+    ctx.fill(); ctx.stroke();
+    ctx.fillStyle = hot ? '#ffb3a6' : '#eaffdc';
+    ctx.font = 'bold 17px "Courier New", monospace';
+    ctx.fillText(label, r.x + r.w / 2, r.y + r.h / 2);
+  }
+}
+function drawChDelAsk(id) {
+  ctx.fillStyle = 'rgba(0,0,0,0.6)';
+  ctx.fillRect(0, 0, W, H);
+  const C = chDelLayout();
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#ffd93d';
+  ctx.font = 'bold 19px "Courier New", monospace';
+  ctx.fillText('删除这顶帽子？', W / 2, C.title);
+  ctx.fillStyle = 'rgba(230,255,235,0.85)';
+  ctx.font = 'bold 14px "Courier New", monospace';
+  ctx.fillText('「' + chName(id) + '」将被永久删除', W / 2, C.text);
+  drawButton(C.yes, '删除', '#ff5b4d');
+  drawButton(C.no, '取消', '#9fdc6b');
+}
+
+function drawHatScreen() {
+  ctx.fillStyle = 'rgba(7,12,9,0.94)';
+  ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+
+  // 标题
+  ctx.fillStyle = '#ffd93d';
+  ctx.font = 'bold 30px "Courier New", monospace';
+  ctx.fillText('装 饰', W / 2, 44);
+
+  // 苹果总库
+  ctx.fillStyle = 'rgba(210,250,225,0.9)';
+  ctx.font = 'bold 16px "Courier New", monospace';
+  ctx.fillText('🍎 ' + appleBank + '   (抽一次 ' + HAT_COST + ')', W / 2, 82);
+
+  // 标签
+  const { tabs, cards } = decorGeometry();
+  for (const t of tabs) {
+    const active = decorTab === t.key;
+    ctx.fillStyle = active ? 'rgba(255,217,61,0.2)' : 'rgba(36,60,40,0.6)';
+    ctx.strokeStyle = active ? '#ffd93d' : 'rgba(140,200,110,0.6)';
+    ctx.lineWidth = active ? 3 : 2;
+    ctx.beginPath();
+    ctx.roundRect(t.x, 104, t.w, 32, 8);
+    ctx.fill(); ctx.stroke();
+    ctx.fillStyle = active ? '#ffd93d' : 'rgba(210,250,225,0.8)';
+    ctx.font = 'bold 14px "Courier New", monospace';
+    ctx.fillText(t.label, t.x + t.w / 2, 120);
+  }
+
+  const isCh = decorTab === 'ch';
+  // 卡片（只显示已拥有）
+  if (cards.length === 0) {
+    ctx.fillStyle = 'rgba(200,230,190,0.85)';
+    ctx.font = 'bold 17px "Courier New", monospace';
+    ctx.fillText(isCh ? '还没有自制帽子' : '还没有装饰', W / 2, 152 + 30);
+    ctx.fillStyle = 'rgba(160,200,170,0.7)';
+    ctx.font = '14px "Courier New", monospace';
+    ctx.fillText(isCh ? '点下方「＋ 新建帽子」亲手画一顶' : '用苹果抽一次，抽到就会显示在这里', W / 2, 152 + 62);
+  } else {
+    for (const c of cards) {
+      const equipped = equippedOf(decorTab) === c.id;
+      ctx.fillStyle = equipped ? 'rgba(255,217,61,0.15)' : 'rgba(36,60,40,0.6)';
+      ctx.strokeStyle = equipped ? '#ffd93d' : 'rgba(140,200,110,0.7)';
+      ctx.lineWidth = equipped ? 3 : 2;
+      ctx.beginPath();
+      ctx.roundRect(c.x, c.y, c.w, c.h, 10);
+      ctx.fill(); ctx.stroke();
+      drawDecorPreview(decorTab, c.id, c.x + 8, c.y + 8, c.w - 16, c.h - 56);
+      // 名字
+      ctx.fillStyle = '#e8ffe0';
+      ctx.font = 'bold 14px "Courier New", monospace';
+      const nm = decoName({ id: c.id, cat: decorTab });
+      ctx.fillText(nm, c.x + c.w / 2, c.y + c.h - 22);
+      // 状态
+      if (equipped) {
+        ctx.fillStyle = '#ffd93d';
+        ctx.font = 'bold 13px "Courier New", monospace';
+        ctx.fillText('✓ 装备中', c.x + c.w / 2, c.y + c.h - 6);
+      } else {
+        ctx.fillStyle = 'rgba(200,230,190,0.8)';
+        ctx.font = '12px "Courier New", monospace';
+        ctx.fillText(isCh ? '点击管理' : '点击装备', c.x + c.w / 2, c.y + c.h - 6);
+      }
+    }
+  }
+
+  const R = decorGeometry().drawBtn;
+  if (isCh) {
+    // 自制帽子页底部：＋ 新建帽子（满员也允许进画板，保存时才提示已满）
+    ctx.fillStyle = 'rgba(46,92,54,0.95)';
+    ctx.strokeStyle = 'rgba(180,250,130,0.9)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.roundRect(R.x, R.y, R.w, R.h, 10);
+    ctx.fill(); ctx.stroke();
+    ctx.fillStyle = '#eaffdc';
+    ctx.font = 'bold 18px "Courier New", monospace';
+    ctx.fillText('＋ 新建帽子', W / 2, R.y + R.h / 2);
+    // 已满提示（画在卡片区中部，半透明不挡操作）
+    if (customHats.length >= CH_MAX) {
+      const by = Math.round((152 + (R.y - 8)) / 2);
+      ctx.fillStyle = 'rgba(8,14,10,0.78)';
+      ctx.strokeStyle = 'rgba(255,217,61,0.9)';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.roundRect(W / 2 - 130, by - 20, 260, 40, 20);
+      ctx.fill(); ctx.stroke();
+      ctx.fillStyle = '#ffd93d';
+      ctx.font = 'bold 16px "Courier New", monospace';
+      ctx.fillText('自制帽子已满 (' + CH_MAX + '/' + CH_MAX + ')', W / 2, by + 1);
+    }
+  } else {
+    // 抽奖按钮（奖池抽完则禁用）
+    const remaining = DECOR_POOL.filter(it => !isOwned(it)).length;
+    const poolEmpty = remaining === 0;
+    const canDraw = !poolEmpty && appleBank >= HAT_COST;
+    ctx.fillStyle = canDraw ? 'rgba(46,92,54,0.95)' : 'rgba(50,50,56,0.7)';
+    ctx.strokeStyle = canDraw ? 'rgba(180,250,130,0.9)' : 'rgba(120,120,130,0.5)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.roundRect(R.x, R.y, R.w, R.h, 10);
+    ctx.fill(); ctx.stroke();
+    ctx.fillStyle = canDraw ? '#eaffdc' : 'rgba(160,160,170,0.7)';
+    ctx.font = 'bold 18px "Courier New", monospace';
+    ctx.fillText(poolEmpty ? '装饰已全部抽完' : '抽奖  ' + HAT_COST + '🍎', W / 2, R.y + R.h / 2);
+
+    // 新手上路引导：箭头指向"抽奖"按钮，引导玩家点一次
+    if (tutorOn()) {
+      drawTutorArrow(R.x + R.w / 2, R.y - 52, '#ffd93d');
+    }
+  }
+
+  // 抽奖结果提示
+  if (hatPrompt && nowMs - hatPrompt.t < 1600) {
+    ctx.fillStyle = hatPrompt.color;
+    ctx.font = 'bold 17px "Courier New", monospace';
+    ctx.fillText(hatPrompt.msg, W / 2, H - 44);
+  }
+
+  // 底部返回提示（桌面端按键提示；移动端用左上角"返回"按钮）
+  if (!isTouch) {
+    ctx.fillStyle = 'rgba(160,200,170,0.6)';
+    ctx.font = '12px "Courier New", monospace';
+    ctx.fillText('按 B / 空格 / ESC 返回主菜单', W / 2, H - 14);
+  }
+  if (isTouch) drawHatBackButton();
+
+  // 自制帽子页的选项菜单 / 删除确认面板（画在最上层）
+  if (chSel != null) drawChOptMenu(chSel);
+  if (chDel != null) drawChDelAsk(chDel);
+}
+
+/* 抽一次：消耗 20 苹果，从共用奖池随机抽取一件未拥有的装饰，自动装备；奖池抽完则不能再抽。
+ * 返回是否真的抽到（成功 true / 抽空或苹果不足 false），供调用方判断是否完成新手引导 */
+function doHatDraw() {
+  const avail = DECOR_POOL.filter(it => !isOwned(it));
+  if (avail.length === 0) {
+    hatPrompt = { msg: '🎁 所有装饰都已抽完', color: '#9fd8c0', t: nowMs };
+    return false;
+  }
+  if (appleBank < HAT_COST) {
+    hatPrompt = { msg: '🍎 苹果不足', color: '#ff8a7a', t: nowMs };
+    return false;
+  }
+  appleBank -= HAT_COST;
+  const item = avail[Math.floor(Math.random() * avail.length)];
+  addOwned(item);
+  setEquipped(item);                 // 抽到即自动装备
+  decorTab = item.cat;               // 自动跳到抽中装饰所在的类别页（hat/skin/scene）
+  hatPrompt = { msg: '★ 获得 ' + decoName(item) + '！已装备', color: '#ffd93d', t: nowMs };
+  saveHatData();
+  return true;
+}
+
+/* ============ 自制帽子：画板编辑器（state 'hatEdit'） ============ */
+/* 画板几何：上方工具、中部 20×20 画板 + 右侧 64 色调色板、下方取消/确认 */
+function chEditGeom() {
+  const cell = 12, N = CH_CELLS;
+  const boardW = cell * N, palCols = 8, palRows = 8, s = 12, gap = 2;
+  const palW = palCols * s + (palCols - 1) * gap;
+  const left = Math.floor((W - (boardW + 14 + palW)) / 2);
+  const bX = Math.max(8, left), pX = bX + boardW + 14;
+  const bY = 178;
+  return {
+    board: { x: bX, y: bY, w: boardW, h: boardW, cell },
+    pal:   { x: pX, y: bY, cols: palCols, rows: palRows, s, gap },
+    tools: [
+      { key: 'brush',  x: W / 2 - 124, y: 124, w: 76, h: 32, label: '画笔' },
+      { key: 'eraser', x: W / 2 - 38,  y: 124, w: 76, h: 32, label: '橡皮' },
+      { key: 'fill',   x: W / 2 + 48,  y: 124, w: 76, h: 32, label: '填充' },
+    ],
+    cancel: { x: W / 2 - 172, y: H - 90, w: 152, h: 46 },
+    ok:     { x: W / 2 + 20,  y: H - 90, w: 152, h: 46 },
+  };
+}
+function chAskGeom() {
+  const bw = Math.min(340, W - 40), bx = (W - bw) / 2;
+  const rows = [
+    { key: 'save',   y: H / 2 - 62 },
+    { key: 'nosave', y: H / 2 - 8 },
+    { key: 'stay',   y: H / 2 + 46 },
+  ];
+  for (const r of rows) { r.x = W / 2 - 110; r.w = 220; r.h = 42; }
+  return { box: { x: bx, y: H / 2 - 168, w: bw, h: 320 }, title: H / 2 - 132, rows };
+}
+function inRect(p, r) { return p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h; }
+function chEvtXY(e) {
+  const rect = canvas.getBoundingClientRect();
+  return { x: (e.clientX - rect.left) * (W / rect.width), y: (e.clientY - rect.top) * (H / rect.height) };
+}
+/* 空白画板：全部像素透明 */
+function chBlankGrid() { const a = new Array(CH_CELLS * CH_CELLS); a.fill(-1); return a; }
+/* 由像素数组生成可渲染图片（缩略图 / 蛇头穿戴共用）；hatImgs 与普通帽共用一套绘制 */
+function chMakeImg(id, px) {
+  const c = document.createElement('canvas');
+  c.width = CH_CELLS; c.height = CH_CELLS;
+  const c2 = c.getContext('2d');
+  const d = c2.createImageData(CH_CELLS, CH_CELLS);
+  for (let i = 0; i < px.length; i++) {
+    const v = px[i], o = i * 4;
+    if (v == null || v < 0) { d.data[o + 3] = 0; continue; }
+    const col = HAT_PAL[v] || '#000000';
+    d.data[o] = parseInt(col.slice(1, 3), 16);
+    d.data[o + 1] = parseInt(col.slice(3, 5), 16);
+    d.data[o + 2] = parseInt(col.slice(5, 7), 16);
+    d.data[o + 3] = 255;
+  }
+  c2.putImageData(d, 0, 0);
+  const im = new Image();
+  im.src = c.toDataURL();
+  hatImgs[id] = im;
+  delete hatBBox[id];
+}
+/* 打开画板：mode new 新建 / edit 修改 id；from 记录从哪来（settings/hats） */
+function openChEditor(mode, id, from) {
+  chMode = mode;
+  chEditId = (mode === 'edit') ? id : null;
+  if (chEditId) {
+    const h = customHats.find(x => x.id === chEditId);
+    chGrid = h ? h.px.slice() : chBlankGrid();
+  } else {
+    chGrid = chBlankGrid();
+  }
+  chTool = 'brush';
+  chColor = 7;              // 默认黑色（在透明画布上最显眼）
+  chAskExit = false;
+  chToast = null;
+  chFrom = from;
+  chSel = null; chDel = null;
+  if (from === 'hats') decorTab = 'ch';
+  state = 'hatEdit';
+}
+/* 离开画板（saved 是否已保存），回到进入前的界面；记录时间戳以吞掉本轮的二次 click */
+function chLeave() {
+  chAskExit = false;
+  chToast = null;
+  chLeftTs = Date.now();
+  if (chFrom === 'settings') state = 'settings';
+  else { decorTab = 'ch'; state = 'hats'; }
+}
+/* 画板提示（顶部小字） */
+function chNote(msg, color) { chToast = { msg, color, t: nowMs }; }
+/* 保存：空白禁止、新建超 12 提示已满；修改则覆盖原帽 */
+function trySaveCh() {
+  if (chGridBlank()) { chNote('请先画点东西再保存', '#ffd93d'); return; }
+  let id;
+  if (chMode === 'new') {
+    if (customHats.length >= CH_MAX) { chNote('自制帽子已满 (' + CH_MAX + '/' + CH_MAX + ')', '#ff8a7a'); return; }
+    id = 'ch_' + Date.now();
+    customHats.push({ id, px: chGrid.slice() });
+  } else {
+    id = chEditId;
+    const h = customHats.find(x => x.id === id);
+    if (h) h.px = chGrid.slice();
+  }
+  chMakeImg(id, chGrid);
+  saveHatData();
+  chLeave();
+}
+/* 单像素上色 / 擦除；拖拽时相邻像素连线 */
+function chPaintAt(gx, gy) {
+  if (gx < 0 || gy < 0 || gx >= CH_CELLS || gy >= CH_CELLS) return;
+  const i = gy * CH_CELLS + gx;
+  chGrid[i] = (chTool === 'eraser') ? -1 : chColor;
+}
+function chPaintLine(gx0, gy0, gx1, gy1) {
+  const dx = Math.abs(gx1 - gx0), dy = Math.abs(gy1 - gy0);
+  const sx = gx0 < gx1 ? 1 : -1, sy = gy0 < gy1 ? 1 : -1;
+  let err = dx - dy, x = gx0, y = gy0;
+  for (; ;) {
+    chPaintAt(x, y);
+    if (x === gx1 && y === gy1) break;
+    const e2 = 2 * err;
+    if (e2 > -dy) { err -= dy; x += sx; }
+    if (e2 < dx) { err += dx; y += sy; }
+  }
+}
+/* 油漆桶填充：连通同色区域替换成当前颜色 */
+function chFlood(gx, gy) {
+  if (gx < 0 || gy < 0 || gx >= CH_CELLS || gy >= CH_CELLS) return;
+  const i0 = gy * CH_CELLS + gx;
+  const target = chGrid[i0];
+  if (target === chColor) return;
+  const st = [i0];
+  while (st.length) {
+    const c = st.pop();
+    if (chGrid[c] !== target) continue;
+    chGrid[c] = chColor;
+    const x = c % CH_CELLS, y = (c - x) / CH_CELLS;
+    if (x > 0) st.push(c - 1);
+    if (x < CH_CELLS - 1) st.push(c + 1);
+    if (y > 0) st.push(c - CH_CELLS);
+    if (y < CH_CELLS - 1) st.push(c + CH_CELLS);
+  }
+}
+/* 删除一顶自制帽子（若正戴着则自动卸下） */
+function chDelete(id) {
+  customHats = customHats.filter(h => h.id !== id);
+  if (equippedCh === id) equippedCh = null;
+  delete hatImgs[id];
+  delete hatBBox[id];
+  chSel = null; chDel = null;
+  saveHatData();
+}
+/* 画板点击/拖动：工具、调色板、画布、取消/确认 */
+function chEditDown(p) {
+  const g = chEditGeom();
+  if (chAskExit) {                       // 取消弹窗：保存并退出 / 不保存 / 继续画
+    const A = chAskGeom();
+    for (const r of A.rows) {
+      if (!inRect(p, r)) continue;
+      if (r.key === 'save') trySaveCh();
+      else if (r.key === 'nosave') chLeave();
+      else chAskExit = false;
+      return;
+    }
+    return;
+  }
+  if (inRect(p, g.cancel)) { chAskExit = true; return; }
+  if (inRect(p, g.ok)) { trySaveCh(); return; }
+  for (const t of g.tools) { if (inRect(p, t)) { chTool = t.key; return; } }
+  // 调色板（64 色 8×8）
+  const P = g.pal;
+  if (p.x >= P.x && p.x < P.x + P.cols * (P.s + P.gap) && p.y >= P.y && p.y < P.y + P.rows * (P.s + P.gap)) {
+    const col = Math.floor((p.x - P.x) / (P.s + P.gap));
+    const row = Math.floor((p.y - P.y) / (P.s + P.gap));
+    if (col >= 0 && col < P.cols && row >= 0 && row < P.rows) { chColor = row * P.cols + col; return; }
+  }
+  // 画板：开始绘制
+  const b = g.board;
+  if (p.x >= b.x && p.x < b.x + b.w && p.y >= b.y && p.y < b.y + b.h) {
+    const gx = Math.floor((p.x - b.x) / b.cell), gy = Math.floor((p.y - b.y) / b.cell);
+    if (chTool === 'fill') { chFlood(gx, gy); _chPaint = false; }
+    else { _chPaint = true; _chLast = { x: gx, y: gy }; chPaintAt(gx, gy); }
+  }
+}
+function chEditMove(p) {
+  if (!_chPaint) return;
+  const b = chEditGeom().board;
+  if (p.x < b.x || p.x >= b.x + b.w || p.y < b.y || p.y >= b.y + b.h) { _chPaint = false; return; }
+  const gx = Math.floor((p.x - b.x) / b.cell), gy = Math.floor((p.y - b.y) / b.cell);
+  if (_chLast) chPaintLine(_chLast.x, _chLast.y, gx, gy); else chPaintAt(gx, gy);
+  _chLast = { x: gx, y: gy };
+}
+/* 画板编辑器界面 */
+function drawHatEditScreen() {
+  ctx.fillStyle = 'rgba(6,11,8,0.97)';
+  ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  // 标题
+  ctx.fillStyle = '#ffd93d';
+  ctx.font = 'bold 28px "Courier New", monospace';
+  ctx.fillText('自制帽子', W / 2, 44);
+  ctx.fillStyle = 'rgba(210,250,225,0.6)';
+  ctx.font = '13px "Courier New", monospace';
+  ctx.fillText(chMode === 'edit' ? '修改：' + chName(chEditId) : '新建帽子（' + customHats.length + '/' + CH_MAX + '）', W / 2, 76);
+  const g = chEditGeom();
+  // 工具（画笔 / 橡皮 / 填充）
+  for (const t of g.tools) {
+    const active = chTool === t.key;
+    ctx.fillStyle = active ? 'rgba(255,217,61,0.25)' : 'rgba(40,66,46,0.95)';
+    ctx.strokeStyle = active ? '#ffd93d' : 'rgba(150,210,130,0.7)';
+    ctx.lineWidth = active ? 3 : 2;
+    ctx.beginPath();
+    ctx.roundRect(t.x, t.y, t.w, t.h, 8);
+    ctx.fill(); ctx.stroke();
+    ctx.fillStyle = active ? '#ffd93d' : 'rgba(225,245,215,0.9)';
+    ctx.font = 'bold 16px "Courier New", monospace';
+    ctx.fillText(t.label, t.x + t.w / 2, t.y + t.h / 2);
+  }
+  // 当前颜色小方块（工具行右侧）
+  ctx.font = '12px "Courier New", monospace';
+  ctx.fillStyle = 'rgba(200,230,190,0.75)';
+  ctx.textAlign = 'right';
+  ctx.fillText('颜色', W / 2 - 168, 140);
+  ctx.fillStyle = HAT_PAL[chColor];
+  ctx.strokeStyle = 'rgba(230,255,235,0.8)';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.rect(W / 2 - 162, 126, 26, 26);
+  ctx.fill(); ctx.stroke();
+  ctx.textAlign = 'center';
+  // 画板（棋盘格表示透明）
+  const b = g.board;
+  ctx.fillStyle = 'rgba(14,22,16,0.9)';
+  ctx.strokeStyle = 'rgba(150,220,150,0.9)';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.roundRect(b.x - 2, b.y - 2, b.w + 4, b.h + 4, 4);
+  ctx.fill(); ctx.stroke();
+  for (let y = 0; y < CH_CELLS; y++) {
+    for (let x = 0; x < CH_CELLS; x++) {
+      const v = chGrid[y * CH_CELLS + x];
+      const px = b.x + x * b.cell, py = b.y + y * b.cell;
+      if (v == null || v < 0) { // 透明 → 浅棋盘格
+        ctx.fillStyle = ((x + y) % 2 === 0) ? 'rgba(38,58,42,0.85)' : 'rgba(50,76,56,0.85)';
+        ctx.fillRect(px, py, b.cell, b.cell);
+      } else {
+        ctx.fillStyle = HAT_PAL[v] || '#000';
+        ctx.fillRect(px, py, b.cell, b.cell);
+        ctx.fillStyle = 'rgba(0,0,0,0.12)';
+        ctx.fillRect(px, py, b.cell, 1);
+        ctx.fillRect(px, py, 1, b.cell);
+      }
+    }
+  }
+  // 调色板
+  const P = g.pal;
+  ctx.font = '11px "Courier New", monospace';
+  ctx.fillStyle = 'rgba(210,240,220,0.7)';
+  ctx.textAlign = 'center';
+  ctx.fillText('64 色', P.x + P.cols * (P.s + P.gap) / 2, P.y - 8);
+  for (let i = 0; i < HAT_PAL.length; i++) {
+    const row = Math.floor(i / P.cols), col = i % P.cols;
+    const px = P.x + col * (P.s + P.gap), py = P.y + row * (P.s + P.gap);
+    ctx.fillStyle = HAT_PAL[i];
+    ctx.fillRect(px, py, P.s, P.s);
+    if (i === chColor) {
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(px - 1, py - 1, P.s + 2, P.s + 2);
+    }
+  }
+  // 底部：取消 / 确认
+  ctx.font = 'bold 17px "Courier New", monospace';
+  ctx.fillStyle = 'rgba(120,40,32,0.95)';
+  ctx.strokeStyle = '#ff8a7a';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.roundRect(g.cancel.x, g.cancel.y, g.cancel.w, g.cancel.h, 10);
+  ctx.fill(); ctx.stroke();
+  ctx.fillStyle = '#ffb3a6';
+  ctx.fillText('取 消', g.cancel.x + g.cancel.w / 2, g.cancel.y + g.cancel.h / 2);
+  ctx.fillStyle = 'rgba(196,160,20,0.95)';
+  ctx.strokeStyle = '#ffd93d';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.roundRect(g.ok.x, g.ok.y, g.ok.w, g.ok.h, 10);
+  ctx.fill(); ctx.stroke();
+  ctx.fillStyle = '#fff3c0';
+  ctx.fillText('确 认', g.ok.x + g.ok.w / 2, g.ok.y + g.ok.h / 2);
+  // 提示
+  if (chToast && nowMs - chToast.t < 2200) {
+    ctx.fillStyle = chToast.color;
+    ctx.font = 'bold 16px "Courier New", monospace';
+    ctx.fillText(chToast.msg, W / 2, H - 122);
+  }
+  // 取消确认弹窗
+  if (chAskExit) {
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.fillRect(0, 0, W, H);
+    const A = chAskGeom();
+    ctx.fillStyle = 'rgba(10,20,13,0.98)';
+    ctx.strokeStyle = 'rgba(255,217,61,0.9)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.roundRect(A.box.x, A.box.y, A.box.w, A.box.h, 12);
+    ctx.fill(); ctx.stroke();
+    ctx.fillStyle = '#ffd93d';
+    ctx.font = 'bold 20px "Courier New", monospace';
+    ctx.fillText('要保存这顶帽子吗？', W / 2, A.title);
+    const labels = { save: '保存并退出', nosave: '不保存直接退出', stay: '继续画' };
+    for (const r of A.rows) {
+      const isSave = r.key === 'save', isNo = r.key === 'nosave';
+      ctx.fillStyle = isSave ? 'rgba(196,160,20,0.95)' : (isNo ? 'rgba(90,40,32,0.95)' : 'rgba(46,92,54,0.95)');
+      ctx.strokeStyle = isSave ? '#ffd93d' : (isNo ? '#ff8a7a' : 'rgba(180,250,130,0.9)');
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.roundRect(r.x, r.y, r.w, r.h, 8);
+      ctx.fill(); ctx.stroke();
+      ctx.fillStyle = isSave ? '#fff3c0' : (isNo ? '#ffb3a6' : '#eaffdc');
+      ctx.font = 'bold 17px "Courier New", monospace';
+      ctx.fillText(labels[r.key], r.x + r.w / 2, r.y + r.h / 2);
+    }
+  }
+}
+/* 画板指针输入（统一鼠标 / 触摸） */
+canvas.addEventListener('pointerdown', (e) => {
+  if (state !== 'hatEdit') return;
+  e.preventDefault();
+  try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
+  chEditDown(chEvtXY(e));
+});
+canvas.addEventListener('pointermove', (e) => {
+  if (state !== 'hatEdit' || !_chPaint) return;
+  chEditMove(chEvtXY(e));
+});
+canvas.addEventListener('pointerup', () => { _chPaint = false; _chLast = null; });
+canvas.addEventListener('pointercancel', () => { _chPaint = false; _chLast = null; });
+
+/* ============ 输入处理 ============ */
+/* 清空输入残留：进出设置界面时调用，避免恢复后蛇自己乱动 */
+function clearInputState() {
+  heldDir = null;
+  pendingMove = null;
+  tapCd = TAP_INTERVAL;
+  holdCd = HOLD_INTERVAL;
+}
+
+window.addEventListener('keydown', (e) => {
+  const k = e.key;
+  // —— 画板编辑器：ESC = 取消（再按一次关闭"是否保存"弹窗）——
+  if (state === 'hatEdit') {
+    if (k === 'Escape' || k === 'Esc') {
+      chAskExit = !chAskExit;                 // 已弹窗时 ESC 回到继续画
+      e.preventDefault();
+    }
+    return;
+  }
+  // —— 隐藏作弊：主菜单快速连按 a-d-a-d，获得 1 万苹果并解锁全部装饰（不显示任何提示）——
+  if (state === 'ready') {
+    const low = k.toLowerCase();
+    if (low === 'a' || low === 'd') {
+      const now = performance.now();
+      if (now - cheatLast > 1200) cheatSeq = '';
+      cheatSeq += low;
+      cheatLast = now;
+      if (cheatSeq.endsWith('adad')) {
+        cheatSeq = '';
+        appleBank += 10000;
+        ownedHats = HAT_IDS.slice();
+        ownedSkins = SKIN_IDS.slice();
+        ownedScenes = SCENE_IDS.slice();
+        saveHatData();
+      } else if (cheatSeq.length > 6) {
+        cheatSeq = cheatSeq.slice(-6);   // 只保留最近 6 个字符，够用即可
+      }
+    }
+  }
+  // —— 装饰界面：B / 空格 / ESC / 回车 返回主菜单；数字 1/2/3 装备当前标签第 1/2/3 件 ——
+  if (state === 'hats') {
+    const chMenuOpen = chSel != null || chDel != null;
+    if (chMenuOpen && (k === 'Escape' || k === 'Esc')) {   // 先关选项菜单/删除确认
+      chSel = null; chDel = null;
+      e.preventDefault();
+      return;
+    }
+    if (k === 'b' || k === 'B' || k === ' ' || k === 'Escape' || k === 'Esc' || k === 'Enter') {
+      chSel = null; chDel = null;
+      state = 'ready';
+    } else if (k === '1' || k === '2' || k === '3') {
+      const list = ownedOf(decorTab);
+      const idx = parseInt(k, 10) - 1;
+      if (idx < list.length && list[idx]) {
+        setEquipped({ id: list[idx], cat: decorTab });
+        saveHatData();
+      }
+    }
+    e.preventDefault();
+    return;
+  }
+  // —— 设置界面（游戏已暂停）：按 空格（或回车/ESC）关闭并返回来源（主菜单或对局） ——
+  if (state === 'settings') {
+    if (resetAsk) {                    // 重置确认弹窗优先：ESC 只取消弹窗
+      if (k === 'Escape' || k === 'Esc') resetAsk = false;
+      e.preventDefault();
+      return;
+    }
+    if (k === ' ' || k === 'Enter' || k === 'Escape' || k === 'Esc') {
+      closeSettings();
+    }
+    e.preventDefault();
+    return;
+  }
+  // —— 主菜单：按 B 进入帽子界面 ——
+  if (state === 'ready' && (k === 'b' || k === 'B')) {
+    hatPrompt = null;
+    state = 'hats';
+    e.preventDefault();
+    return;
+  }
+  // —— 主菜单：按 ESC 打开设置界面 ——
+  if (state === 'ready' && (k === 'Escape' || k === 'Esc')) {
+    settingsFrom = 'ready';
+    resetAsk = false;
+    state = 'settings';
+    e.preventDefault();
+    return;
+  }
+  // —— 游戏中的方向操作 ——
+  if (k === 'ArrowLeft' || k === 'a' || k === 'A') {
+    if (state === 'playing' && !e.repeat) {   // 只认第一次按下；自动重复忽略
+      heldDir = [-1, 0];
+      holdCd = 0;                 // 长按计时从按下开始
+      pendingMove = [-1, 0];      // 待走方向（走格节奏由点按/长按冷却决定）
+    }
+    e.preventDefault();
+  } else if (k === 'ArrowRight' || k === 'd' || k === 'D') {
+    if (state === 'playing' && !e.repeat) {
+      heldDir = [1, 0];
+      holdCd = 0;
+      pendingMove = [1, 0];
+    }
+    e.preventDefault();
+  } else if (k === 'ArrowUp' || k === 'w' || k === 'W') {
+    if (state === 'playing' && !e.repeat) {   // 向上走一格（蛇身会垫到脚下）
+      heldDir = [0, -1];
+      holdCd = 0;
+      pendingMove = [0, -1];
+    }
+    e.preventDefault();
+  } else if (k === ' ') {
+    e.preventDefault();
+    if (state === 'ready' && !tutorOn()) { clearInputState(); startGame(); }   // 引导中不可开始
+    // 死亡后空格 → 回到主菜单（再按一次空格才开始新一局），同时重启 AI 背景演示
+    else if (state === 'dead' && nowMs - deathAt > 350) { goReady(); }
+  } else if (k === 'Escape' || k === 'Esc') {
+    if (state === 'playing') {    // 打开设置并暂停
+      clearInputState();
+      settingsFrom = 'playing';
+      resetAsk = false;
+      state = 'settings';
+    }
+    e.preventDefault();
+  }
+});
+/* ============ 鼠标点击：主菜单装饰按钮 / 装饰界面标签·卡片·抽奖 ============ */
+canvas.addEventListener('click', (e) => {
+  if (Date.now() - chLeftTs < 300) return;   // 刚从画板返回：吞掉同一次点击的残留 click，避免误触底部按钮
+  const rect = canvas.getBoundingClientRect();
+  const px = (e.clientX - rect.left) * (W / rect.width);
+  const py = (e.clientY - rect.top) * (H / rect.height);
+  const p = { x: px, y: py };
+  if (state === 'ready') {
+    // 右下角"装饰"按钮
+    const R = menuBtnHat();
+    if (inRect(p, R)) {
+      hatPrompt = null;
+      state = 'hats';
+      return;
+    }
+    // 左下角"设置"按钮
+    const S = menuBtnSettings();
+    if (inRect(p, S)) {
+      settingsFrom = 'ready';
+      resetAsk = false;
+      state = 'settings';
+      return;
+    }
+  } else if (state === 'settings') {
+    // 重置确认弹窗优先
+    if (resetAsk) {
+      const C = confirmLayout();
+      if (inRect(p, C.yes)) { resetAllData(); resetAsk = false; return; }
+      if (inRect(p, C.no)) { resetAsk = false; return; }
+      return;
+    }
+    // 普通设置项（与绘制共用同一组坐标）
+    const geo = settingsGeometry();
+    for (const it of geo.items) {
+      if (!inRect(p, it)) continue;
+      if (it.key === 'sound') { setSound(!soundOn); return; }
+      if (it.key === 'scan') { setScanline(!scanlineOn); return; }
+      if (it.key === 'back') {
+        clearInputState();
+        resetAsk = false;
+        state = settingsFrom === 'playing' ? 'playing' : 'ready';
+        return;
+      }
+      if (it.key === 'giveup') { abandonGame(); return; }
+    }
+    // 重置游戏数据（固定在底部）
+    if (inRect(p, geo.reset)) { resetAsk = true; return; }
+  } else if (state === 'hats') {
+    const { tabs, cards, drawBtn } = decorGeometry();
+    // —— 自制帽子：删除确认面板（最上层）——
+    if (chDel != null) {
+      const C = chDelLayout();
+      if (inRect(p, C.yes)) chDelete(chDel);
+      else if (inRect(p, C.no)) chDel = null;
+      return;
+    }
+    // —— 自制帽子：选项菜单（穿戴 / 修改 / 删除 / 取消）——
+    if (chSel != null) {
+      const g = chOptLayout();
+      for (const r of g.rows) {
+        if (!inRect(p, r)) continue;
+        if (r.key === 'wear') {
+          if (equippedCh === chSel) { equippedCh = null; saveHatData(); }   // 正穿着 → 再点即卸下
+          else wearCh(chSel);
+          chSel = null;
+        } else if (r.key === 'edit') { openChEditor('edit', chSel, 'hats'); }
+        else if (r.key === 'del') { chDel = chSel; }
+        else chSel = null;
+        return;
+      }
+      return;
+    }
+    // 移动端：左上角"返回"按钮 → 回主菜单
+    if (isTouch) {
+      const B = hatBackBtn();
+      if (inRect(p, B)) { goReady(); return; }
+    }
+    // 底部按钮：自制帽子页＝＋新建；其它＝抽奖（只有真抽到才完成新手引导）
+    if (inRect(p, drawBtn)) {
+      if (decorTab === 'ch') { openChEditor('new', null, 'hats'); return; }
+      if (doHatDraw()) completeTutor();   // 抽到装饰 → 引导完成；抽空/苹果不足则保留引导
+      return;
+    }
+    // 标签 → 切换类别
+    for (const t of tabs) {
+      if (p.x >= t.x && p.x <= t.x + t.w && p.y >= 104 && p.y <= 136) { decorTab = t.key; chSel = null; chDel = null; return; }
+    }
+    // 卡片：自制帽子页点开选项菜单；其它类别点击即装备
+    for (const c of cards) {
+      if (!inRect(p, c)) continue;
+      if (decorTab === 'ch') { chSel = c.id; return; }
+      if (ownedOf(decorTab).indexOf(c.id) >= 0) {
+        setEquipped({ id: c.id, cat: decorTab });
+        saveHatData();
+      }
+      return;
+    }
+  }
+});
+/* 松开方向键 → 停止长按移动 */
+window.addEventListener('keyup', (e) => {
+  const k = e.key;
+  if ((k === 'ArrowLeft' || k === 'a' || k === 'A') && heldDir && heldDir[0] === -1) heldDir = null;
+  else if ((k === 'ArrowRight' || k === 'd' || k === 'D') && heldDir && heldDir[0] === 1) heldDir = null;
+  else if ((k === 'ArrowUp' || k === 'w' || k === 'W') && heldDir && heldDir[1] === -1) heldDir = null;
+});
+
+/* ============ 移动端支持 ============
+ * 暂停按钮：对局/暂停中显示，点按切换（桌面端用 ESC）
+ * 触控滑动：对局中全屏滑动——左右滑移动方向、上滑爬一格、下滑无效；其余界面点按走原生 click
+ */
+const pauseBtn = document.getElementById('pauseBtn');
+function updatePauseBtn() {
+  const show = isTouch && (state === 'playing' || state === 'settings');
+  pauseBtn.classList.toggle('hidden', !show);
+}
+pauseBtn.addEventListener('click', (ev) => {
+  ev.stopPropagation();
+  if (state === 'playing') { clearInputState(); settingsFrom = 'playing'; resetAsk = false; state = 'settings'; }
+  else if (state === 'settings') {
+    clearInputState();
+    resetAsk = false;
+    // 从主菜单打开设置时该"返回"应回主菜单，而不是直接开一局
+    state = settingsFrom === 'playing' ? 'playing' : 'ready';
+  }
+});
+
+let _ts = null;   // 触控起点
+window.addEventListener('touchstart', (e) => {
+  const t = e.changedTouches[0];
+  _ts = { x: t.clientX, y: t.clientY };
+}, { passive: true });
+
+window.addEventListener('touchend', (e) => {
+  if (!_ts) return;
+  const t = e.changedTouches[0];
+  const dx = t.clientX - _ts.x, dy = t.clientY - _ts.y;
+  const dist = Math.hypot(dx, dy);
+  _ts = null;
+
+  if (state !== 'playing') {
+    // 点按（非滑动）：交由原生 click 处理菜单/装饰；这里只补主菜单开始与结算返回
+    if (dist < 20) {
+      const rect = canvas.getBoundingClientRect();
+      const px = (t.clientX - rect.left) * (W / rect.width);
+      const py = (t.clientY - rect.top) * (H / rect.height);
+      if (state === 'ready' && px >= 0 && px <= W && py >= 0 && py <= H) {
+        const R = menuBtnHat(), S = menuBtnSettings();
+        const onBtn = inRect({ x: px, y: py }, R) || inRect({ x: px, y: py }, S);
+        if (!onBtn && !tutorOn()) { clearInputState(); startGame(); }   // 引导中不可开始
+      } else if (state === 'dead' && nowMs - deathAt > 350) {
+        goReady();
+      }
+    }
+    return;
+  }
+
+  // 对局中：识别为滑动才移动；点按不做事（避免误触）
+  if (dist < 20) return;
+  const adx = Math.abs(dx), ady = Math.abs(dy);
+  if (adx > ady) {
+    pendingMove = [dx > 0 ? 1 : -1, 0];      // 左右滑动
+  } else if (dy < 0) {
+    pendingMove = [0, -1];                    // 上滑爬一格
+  }
+}, { passive: true });
+
+/* ============ 主循环（requestAnimationFrame 60fps） ============ */
+let lastTime = 0;
+function loop(t) {
+  requestAnimationFrame(loop);
+  nowMs = t;
+  ensureTutorLatch();
+  let dt = (t - lastTime) / 1000;
+  lastTime = t;
+  if (dt > 1 / 30) dt = 1 / 30;
+  if (dt > 0) update(dt);
+  draw();
+  updatePauseBtn();
+}
+
+/* 初始化并启动主菜单背景自动演示 */
+startDemo();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
+
+
